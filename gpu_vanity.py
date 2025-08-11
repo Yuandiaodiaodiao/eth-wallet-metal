@@ -1,7 +1,19 @@
 import os
+import time
 import secrets
 import threading
 from typing import List, Tuple, Optional
+
+# Precompute curve order bytes once to speed privkey validity checks
+try:
+    from ecdsa import SECP256k1  # type: ignore
+    SECP256K1_ORDER_BYTES = SECP256k1.order.to_bytes(32, "big")
+except Exception:  # Fallback if ecdsa not importable at import-time
+    SECP256K1_ORDER_BYTES = int(
+        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    ).to_bytes(32, "big")
+
+ZERO_32 = b"\x00" * 32
 
 from Metal import MTLCreateSystemDefaultDevice, MTLSizeMake
 
@@ -244,82 +256,8 @@ KERNEL_FQ void vanity_kernel_compact(
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
-        # Reusable buffers for synchronous path to reduce allocations
-        self._rb_in = None
-        self._rb_addr = None
-        self._rb_flags = None
-        self._rb_params = None
-        self._rb_in_cap = 0
-        self._rb_addr_cap = 0
-        self._rb_flags_cap = 0
-
-    def run_batch(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> Tuple[List[bytes], List[int]]:
-        if not privkeys_be32:
-            return [], []
-        for i, k in enumerate(privkeys_be32):
-            if len(k) != 32:
-                raise ValueError(f"privkey[{i}] must be 32 bytes")
-        count = len(privkeys_be32)
-        in_size = 32 * count
-        out_addr_size = 20 * count
-        out_flag_size = count
-
-        # Ensure reusable buffers
-        if self._rb_in is None or self._rb_in_cap < in_size:
-            self._rb_in = self.device.newBufferWithLength_options_(in_size, 0)
-            self._rb_in_cap = in_size
-        if self._rb_addr is None or self._rb_addr_cap < out_addr_size:
-            self._rb_addr = self.device.newBufferWithLength_options_(out_addr_size, 0)
-            self._rb_addr_cap = out_addr_size
-        if self._rb_flags is None or self._rb_flags_cap < out_flag_size:
-            self._rb_flags = self.device.newBufferWithLength_options_(out_flag_size, 0)
-            self._rb_flags_cap = out_flag_size
-        if self._rb_params is None:
-            self._rb_params = self.device.newBufferWithLength_options_(12, 0)
-        in_buffer = self._rb_in
-        addr_buffer = self._rb_addr
-        flags_buffer = self._rb_flags
-        params_buffer = self._rb_params
-
-        joined = b"".join(privkeys_be32)
-        in_buffer.contents().as_buffer(in_size)[:in_size] = joined
-
-        # params
-        p = bytearray(12)
-        p[0:4] = int(count).to_bytes(4, "little")
-        p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
-        p[8:12] = int(nibble_count).to_bytes(4, "little")
-        params_buffer.contents().as_buffer(12)[:12] = bytes(p)
-
-        cb = self.queue.commandBuffer()
-        enc = cb.computeCommandEncoder()
-        enc.setComputePipelineState_(self.pipeline)
-        enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        enc.setBuffer_offset_atIndex_(addr_buffer, 0, 1)
-        enc.setBuffer_offset_atIndex_(flags_buffer, 0, 2)
-        enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
-
-        w = int(self.thread_execution_width)
-        try:
-            max_threads = int(self.pipeline.maxTotalThreadsPerThreadgroup())
-        except Exception:
-            max_threads = 256
-        # Use a multiple of execution width for better occupancy, but respect device limits
-        tpt = min(max_threads, max(w * 4, w))
-        tg = MTLSizeMake(tpt, 1, 1)
-        grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
-        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
-
-        addr_bytes = bytes(addr_buffer.contents().as_buffer(out_addr_size)[:out_addr_size])
-        flags_bytes = bytes(flags_buffer.contents().as_buffer(out_flag_size)[:out_flag_size])
-        addrs = [addr_bytes[i*20:(i+1)*20] for i in range(count)]
-        flags = [flags_bytes[i] for i in range(count)]
-        return addrs, flags
-
-    # --- Pipelined API ---
+        # Keep no reusable buffers here; API supports overlapping jobs, so use per-job buffers
+   # --- Pipelined API ---
     class VanityJob:
         def __init__(self, cb, addr_buffer, flags_buffer, out_addr_size: int, out_flag_size: int, count: int):
             self.cb = cb
@@ -333,6 +271,10 @@ KERNEL_FQ void vanity_kernel_compact(
             self._addrs: Optional[List[bytes]] = None
             self._flags: Optional[List[int]] = None
             self._error: Optional[Exception] = None
+            # Timing
+            self.cpu_encode_seconds: float = 0.0
+            self.gpu_start_time: float = -1.0
+            self.gpu_end_time: float = -1.0
 
     def encode_and_commit(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJob":
         if not privkeys_be32:
@@ -345,36 +287,47 @@ KERNEL_FQ void vanity_kernel_compact(
         out_addr_size = 20 * count
         out_flag_size = count
 
+        # Per-job buffers (safe for overlapping command buffers)
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
         addr_buffer = self.device.newBufferWithLength_options_(out_addr_size, 0)
         flags_buffer = self.device.newBufferWithLength_options_(out_flag_size, 0)
-        params_buffer = self.device.newBufferWithLength_options_(12, 0)
+        # Params will be set inline via setBytes to avoid allocating a buffer each call
 
-        joined = b"".join(privkeys_be32)
-        in_buffer.contents().as_buffer(in_size)[:in_size] = joined
+        # Fill input buffer without creating a large temporary joined bytes
+        in_mv = in_buffer.contents().as_buffer(in_size)
+        for i, k in enumerate(privkeys_be32):
+            off = i * 32
+            in_mv[off : off + 32] = k
 
         p = bytearray(12)
         p[0:4] = int(count).to_bytes(4, "little")
         p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
         p[8:12] = int(nibble_count).to_bytes(4, "little")
-        params_buffer.contents().as_buffer(12)[:12] = bytes(p)
+        t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
         enc.setComputePipelineState_(self.pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(addr_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(flags_buffer, 0, 2)
-        enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
+        # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
+        try:
+            enc.setBytes_length_atIndex_(bytes(p), 12, 3)
+        except Exception:
+            params_buffer = self.device.newBufferWithLength_options_(12, 0)
+            params_buffer.contents().as_buffer(12)[:12] = bytes(p)
+            enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
 
         w = int(self.thread_execution_width)
         try:
             max_threads = int(self.pipeline.maxTotalThreadsPerThreadgroup())
         except Exception:
             max_threads = 256
-        # Use a multiple of execution width for better occupancy, but respect device limits
-        tpt = min(max_threads, max(w * 4, w))
+        # Use a multiple of execution width for better occupancy, but respect device limits and problem size
+        tpt = min(max_threads, max(w * 4, w), max(1, count))
         tg = MTLSizeMake(tpt, 1, 1)
-        grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
+        # Dispatch exactly 'count' threads; avoid padded idle threads
+        grid = MTLSizeMake(count, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
         enc.endEncoding()
 
@@ -387,6 +340,12 @@ KERNEL_FQ void vanity_kernel_compact(
                 flags_bytes = bytes(job.flags_buffer.contents().as_buffer(job.out_flag_size)[:job.out_flag_size])
                 job._addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(job.count)]
                 job._flags = [flags_bytes[i] for i in range(job.count)]
+                # GPU timing if supported
+                try:
+                    job.gpu_start_time = float(inner_cb.GPUStartTime())  # type: ignore[attr-defined]
+                    job.gpu_end_time = float(inner_cb.GPUEndTime())      # type: ignore[attr-defined]
+                except Exception:
+                    pass
             except Exception as e:
                 job._error = e
             finally:
@@ -395,6 +354,7 @@ KERNEL_FQ void vanity_kernel_compact(
         cb.addCompletedHandler_(_on_completed)
         # Submit
         cb.commit()
+        job.cpu_encode_seconds = time.perf_counter() - t_cpu0
 
         return job
 
@@ -418,6 +378,10 @@ KERNEL_FQ void vanity_kernel_compact(
             self._addrs: Optional[List[bytes]] = None
             self._indices: Optional[List[int]] = None
             self._error: Optional[Exception] = None
+            # Timing
+            self.cpu_encode_seconds: float = 0.0
+            self.gpu_start_time: float = -1.0
+            self.gpu_end_time: float = -1.0
 
     def encode_and_commit_compact(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
         if not privkeys_be32:
@@ -431,15 +395,18 @@ KERNEL_FQ void vanity_kernel_compact(
         addr_cap_bytes = 20 * count
         idx_cap_bytes = 4 * count
 
+        # Per-job buffers; overlapping jobs are expected
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
         addr_compact_buffer = self.device.newBufferWithLength_options_(addr_cap_bytes, 0)
         index_compact_buffer = self.device.newBufferWithLength_options_(idx_cap_bytes, 0)
         out_count_buffer = self.device.newBufferWithLength_options_(4, 0)
-        params_buffer = self.device.newBufferWithLength_options_(12, 0)
+        # Params will be set inline via setBytes to avoid allocating a buffer each call
 
-        # Fill inputs
-        joined = b"".join(privkeys_be32)
-        in_buffer.contents().as_buffer(in_size)[:in_size] = joined
+        # Fill inputs without creating a large temporary joined bytes
+        in_mv = in_buffer.contents().as_buffer(in_size)
+        for i, k in enumerate(privkeys_be32):
+            off = i * 32
+            in_mv[off : off + 32] = k
 
         # Zero out_count
         out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
@@ -449,8 +416,8 @@ KERNEL_FQ void vanity_kernel_compact(
         p[0:4] = int(count).to_bytes(4, "little")
         p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
         p[8:12] = int(nibble_count).to_bytes(4, "little")
-        params_buffer.contents().as_buffer(12)[:12] = bytes(p)
 
+        t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
         enc.setComputePipelineState_(self.pipeline_compact)
@@ -458,16 +425,23 @@ KERNEL_FQ void vanity_kernel_compact(
         enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 2)
         enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 3)
-        enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+        # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
+        try:
+            enc.setBytes_length_atIndex_(bytes(p), 12, 4)
+        except Exception:
+            params_buffer = self.device.newBufferWithLength_options_(12, 0)
+            params_buffer.contents().as_buffer(12)[:12] = bytes(p)
+            enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
 
         w = int(self.thread_execution_width)
         try:
             max_threads = int(self.pipeline_compact.maxTotalThreadsPerThreadgroup())
         except Exception:
             max_threads = 256
-        tpt = min(max_threads, max(w * 4, w))
+        tpt = min(max_threads, max(w * 4, w), max(1, count))
         tg = MTLSizeMake(tpt, 1, 1)
-        grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
+        # Dispatch exactly 'count' threads; avoid padded idle threads
+        grid = MTLSizeMake(count, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
         enc.endEncoding()
 
@@ -486,6 +460,12 @@ KERNEL_FQ void vanity_kernel_compact(
                 indices = [int.from_bytes(idx_bytes[i * 4 : (i + 1) * 4], "little") for i in range(out_count)]
                 job._addrs = addrs
                 job._indices = indices
+                # GPU timing if supported
+                try:
+                    job.gpu_start_time = float(inner_cb.GPUStartTime())  # type: ignore[attr-defined]
+                    job.gpu_end_time = float(inner_cb.GPUEndTime())      # type: ignore[attr-defined]
+                except Exception:
+                    pass
             except Exception as e:
                 job._error = e
             finally:
@@ -493,6 +473,7 @@ KERNEL_FQ void vanity_kernel_compact(
 
         cb.addCompletedHandler_(_on_completed)
         cb.commit()
+        job.cpu_encode_seconds = time.perf_counter() - t_cpu0
         return job
 
     def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int]]:
@@ -503,20 +484,17 @@ KERNEL_FQ void vanity_kernel_compact(
 
 
 def generate_valid_privkeys(batch_size: int) -> List[bytes]:
-    # Ensure 1 <= k < n
-    from ecdsa import SECP256k1
-    n = SECP256k1.order
+    # Ensure 1 <= k < n, using lexicographic byte comparisons to avoid big-int conversions
     out: List[bytes] = []
-    # Bulk-sample to reduce Python overhead
-    # We overshoot by ~12.5% to reduce number of iterations when rejections occur (very rare)
     target = batch_size
+    n_bytes = SECP256K1_ORDER_BYTES
     while len(out) < target:
-        chunk = max(1024, (target - len(out)) * 2)
+        # Larger chunk reduces Python overhead for very fast GPUs
+        chunk = max(8192, (target - len(out)) * 4)
         buf = secrets.token_bytes(32 * chunk)
         for i in range(chunk):
             k = buf[i * 32 : (i + 1) * 32]
-            ki = int.from_bytes(k, "big")
-            if 1 <= ki < n:
+            if k != ZERO_32 and k < n_bytes:
                 out.append(k)
                 if len(out) >= target:
                     break
