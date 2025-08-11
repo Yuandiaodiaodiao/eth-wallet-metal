@@ -406,17 +406,120 @@ KERNEL_FQ void vanity_kernel_compact(
         # mypy: these are set once done_event is set
         return job._addrs or [], job._flags or []
 
+    # --- Compact-output pipelined API ---
+    class VanityJobCompact:
+        def __init__(self, cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, capacity_count: int):
+            self.cb = cb
+            self.addr_compact_buffer = addr_compact_buffer
+            self.index_compact_buffer = index_compact_buffer
+            self.out_count_buffer = out_count_buffer
+            self.capacity_count = capacity_count
+            self._done_event: threading.Event = threading.Event()
+            self._addrs: Optional[List[bytes]] = None
+            self._indices: Optional[List[int]] = None
+            self._error: Optional[Exception] = None
+
+    def encode_and_commit_compact(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
+        if not privkeys_be32:
+            raise ValueError("privkeys_be32 must not be empty")
+        for i, k in enumerate(privkeys_be32):
+            if len(k) != 32:
+                raise ValueError(f"privkey[{i}] must be 32 bytes")
+        count = len(privkeys_be32)
+        in_size = 32 * count
+        # Worst-case we allocate full capacity; actual matches are typically few
+        addr_cap_bytes = 20 * count
+        idx_cap_bytes = 4 * count
+
+        in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
+        addr_compact_buffer = self.device.newBufferWithLength_options_(addr_cap_bytes, 0)
+        index_compact_buffer = self.device.newBufferWithLength_options_(idx_cap_bytes, 0)
+        out_count_buffer = self.device.newBufferWithLength_options_(4, 0)
+        params_buffer = self.device.newBufferWithLength_options_(12, 0)
+
+        # Fill inputs
+        joined = b"".join(privkeys_be32)
+        in_buffer.contents().as_buffer(in_size)[:in_size] = joined
+
+        # Zero out_count
+        out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
+
+        # params
+        p = bytearray(12)
+        p[0:4] = int(count).to_bytes(4, "little")
+        p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
+        p[8:12] = int(nibble_count).to_bytes(4, "little")
+        params_buffer.contents().as_buffer(12)[:12] = bytes(p)
+
+        cb = self.queue.commandBuffer()
+        enc = cb.computeCommandEncoder()
+        enc.setComputePipelineState_(self.pipeline_compact)
+        enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
+        enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
+        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 2)
+        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 3)
+        enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+
+        w = int(self.thread_execution_width)
+        try:
+            max_threads = int(self.pipeline_compact.maxTotalThreadsPerThreadgroup())
+        except Exception:
+            max_threads = 256
+        tpt = min(max_threads, max(w * 4, w))
+        tg = MTLSizeMake(tpt, 1, 1)
+        grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
+        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+        enc.endEncoding()
+
+        job = MetalVanity.VanityJobCompact(cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, count)
+
+        def _on_completed(inner_cb):
+            try:
+                # Read number of matches
+                c_bytes = bytes(job.out_count_buffer.contents().as_buffer(4)[:4])
+                out_count = int.from_bytes(c_bytes, "little")
+                out_count = max(0, min(out_count, job.capacity_count))
+                # Read compact addresses and indices
+                addr_bytes = bytes(job.addr_compact_buffer.contents().as_buffer(20 * job.capacity_count)[: 20 * out_count])
+                idx_bytes = bytes(job.index_compact_buffer.contents().as_buffer(4 * job.capacity_count)[: 4 * out_count])
+                addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(out_count)]
+                indices = [int.from_bytes(idx_bytes[i * 4 : (i + 1) * 4], "little") for i in range(out_count)]
+                job._addrs = addrs
+                job._indices = indices
+            except Exception as e:
+                job._error = e
+            finally:
+                job._done_event.set()
+
+        cb.addCompletedHandler_(_on_completed)
+        cb.commit()
+        return job
+
+    def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int]]:
+        job._done_event.wait()
+        if job._error is not None:
+            raise job._error
+        return job._addrs or [], job._indices or []
+
 
 def generate_valid_privkeys(batch_size: int) -> List[bytes]:
     # Ensure 1 <= k < n
     from ecdsa import SECP256k1
     n = SECP256k1.order
     out: List[bytes] = []
-    while len(out) < batch_size:
-        k = secrets.token_bytes(32)
-        ki = int.from_bytes(k, "big")
-        if 1 <= ki < n:
-            out.append(k)
+    # Bulk-sample to reduce Python overhead
+    # We overshoot by ~12.5% to reduce number of iterations when rejections occur (very rare)
+    target = batch_size
+    while len(out) < target:
+        chunk = max(1024, (target - len(out)) * 2)
+        buf = secrets.token_bytes(32 * chunk)
+        for i in range(chunk):
+            k = buf[i * 32 : (i + 1) * 32]
+            ki = int.from_bytes(k, "big")
+            if 1 <= ki < n:
+                out.append(k)
+                if len(out) >= target:
+                    break
     return out
 
 
