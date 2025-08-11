@@ -1,6 +1,7 @@
 import os
 import secrets
-from typing import List, Tuple
+import threading
+from typing import List, Tuple, Optional
 
 from Metal import MTLCreateSystemDefaultDevice, MTLSizeMake
 
@@ -23,16 +24,45 @@ class MetalVanity:
         vendor_text = _load_text_no_includes(os.path.join(secp_dir, "inc_vendor.h"))
         src_parts.append(vendor_text)
         src_parts.append("\n#undef DECLSPEC\n#define DECLSPEC inline static\n")
-        src_parts.append("#undef SECP256K1_TMPS_TYPE\n#define SECP256K1_TMPS_TYPE PRIVATE_AS\n")
+        # Use constant address space for shared precomputed basepoint to avoid per-thread copies
+        src_parts.append("#undef SECP256K1_TMPS_TYPE\n#define SECP256K1_TMPS_TYPE CONSTANT_AS\n")
         src_parts.append(_load_text_no_includes(os.path.join(secp_dir, "inc_types.h")))
         src_parts.append("\n")
         src_parts.append(_load_text_no_includes(os.path.join(secp_dir, "inc_ecc_secp256k1.h")))
         src_parts.append("\n")
         src_parts.append(_load_text_no_includes(os.path.join(secp_dir, "inc_ecc_secp256k1.cl")))
 
-        # Append Keccak functions (fixed-size 64-byte input)
+        # Append Keccak functions (fixed-size 64-byte input) and constant precomputed secp256k1 basepoint
         src_parts.append(
             r'''
+// Precomputed basepoint table in constant memory to be shared across all threads
+constant secp256k1_t G_PRECOMP = { {
+    SECP256K1_G_PRE_COMPUTED_00, SECP256K1_G_PRE_COMPUTED_01, SECP256K1_G_PRE_COMPUTED_02, SECP256K1_G_PRE_COMPUTED_03,
+    SECP256K1_G_PRE_COMPUTED_04, SECP256K1_G_PRE_COMPUTED_05, SECP256K1_G_PRE_COMPUTED_06, SECP256K1_G_PRE_COMPUTED_07,
+    SECP256K1_G_PRE_COMPUTED_08, SECP256K1_G_PRE_COMPUTED_09, SECP256K1_G_PRE_COMPUTED_10, SECP256K1_G_PRE_COMPUTED_11,
+    SECP256K1_G_PRE_COMPUTED_12, SECP256K1_G_PRE_COMPUTED_13, SECP256K1_G_PRE_COMPUTED_14, SECP256K1_G_PRE_COMPUTED_15,
+    SECP256K1_G_PRE_COMPUTED_16, SECP256K1_G_PRE_COMPUTED_17, SECP256K1_G_PRE_COMPUTED_18, SECP256K1_G_PRE_COMPUTED_19,
+    SECP256K1_G_PRE_COMPUTED_20, SECP256K1_G_PRE_COMPUTED_21, SECP256K1_G_PRE_COMPUTED_22, SECP256K1_G_PRE_COMPUTED_23,
+    SECP256K1_G_PRE_COMPUTED_24, SECP256K1_G_PRE_COMPUTED_25, SECP256K1_G_PRE_COMPUTED_26, SECP256K1_G_PRE_COMPUTED_27,
+    SECP256K1_G_PRE_COMPUTED_28, SECP256K1_G_PRE_COMPUTED_29, SECP256K1_G_PRE_COMPUTED_30, SECP256K1_G_PRE_COMPUTED_31,
+    SECP256K1_G_PRE_COMPUTED_32, SECP256K1_G_PRE_COMPUTED_33, SECP256K1_G_PRE_COMPUTED_34, SECP256K1_G_PRE_COMPUTED_35,
+    SECP256K1_G_PRE_COMPUTED_36, SECP256K1_G_PRE_COMPUTED_37, SECP256K1_G_PRE_COMPUTED_38, SECP256K1_G_PRE_COMPUTED_39,
+    SECP256K1_G_PRE_COMPUTED_40, SECP256K1_G_PRE_COMPUTED_41, SECP256K1_G_PRE_COMPUTED_42, SECP256K1_G_PRE_COMPUTED_43,
+    SECP256K1_G_PRE_COMPUTED_44, SECP256K1_G_PRE_COMPUTED_45, SECP256K1_G_PRE_COMPUTED_46, SECP256K1_G_PRE_COMPUTED_47,
+    SECP256K1_G_PRE_COMPUTED_48, SECP256K1_G_PRE_COMPUTED_49, SECP256K1_G_PRE_COMPUTED_50, SECP256K1_G_PRE_COMPUTED_51,
+    SECP256K1_G_PRE_COMPUTED_52, SECP256K1_G_PRE_COMPUTED_53, SECP256K1_G_PRE_COMPUTED_54, SECP256K1_G_PRE_COMPUTED_55,
+    SECP256K1_G_PRE_COMPUTED_56, SECP256K1_G_PRE_COMPUTED_57, SECP256K1_G_PRE_COMPUTED_58, SECP256K1_G_PRE_COMPUTED_59,
+    SECP256K1_G_PRE_COMPUTED_60, SECP256K1_G_PRE_COMPUTED_61, SECP256K1_G_PRE_COMPUTED_62, SECP256K1_G_PRE_COMPUTED_63,
+    SECP256K1_G_PRE_COMPUTED_64, SECP256K1_G_PRE_COMPUTED_65, SECP256K1_G_PRE_COMPUTED_66, SECP256K1_G_PRE_COMPUTED_67,
+    SECP256K1_G_PRE_COMPUTED_68, SECP256K1_G_PRE_COMPUTED_69, SECP256K1_G_PRE_COMPUTED_70, SECP256K1_G_PRE_COMPUTED_71,
+    SECP256K1_G_PRE_COMPUTED_72, SECP256K1_G_PRE_COMPUTED_73, SECP256K1_G_PRE_COMPUTED_74, SECP256K1_G_PRE_COMPUTED_75,
+    SECP256K1_G_PRE_COMPUTED_76, SECP256K1_G_PRE_COMPUTED_77, SECP256K1_G_PRE_COMPUTED_78, SECP256K1_G_PRE_COMPUTED_79,
+    SECP256K1_G_PRE_COMPUTED_80, SECP256K1_G_PRE_COMPUTED_81, SECP256K1_G_PRE_COMPUTED_82, SECP256K1_G_PRE_COMPUTED_83,
+    SECP256K1_G_PRE_COMPUTED_84, SECP256K1_G_PRE_COMPUTED_85, SECP256K1_G_PRE_COMPUTED_86, SECP256K1_G_PRE_COMPUTED_87,
+    SECP256K1_G_PRE_COMPUTED_88, SECP256K1_G_PRE_COMPUTED_89, SECP256K1_G_PRE_COMPUTED_90, SECP256K1_G_PRE_COMPUTED_91,
+    SECP256K1_G_PRE_COMPUTED_92, SECP256K1_G_PRE_COMPUTED_93, SECP256K1_G_PRE_COMPUTED_94, SECP256K1_G_PRE_COMPUTED_95
+} };
+
 inline ulong rotl64(ulong x, ushort n) { return (x << n) | (x >> (64 - n)); }
 constant ulong K_RC[24] = {
     0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
@@ -103,8 +133,7 @@ KERNEL_FQ void vanity_kernel(
     k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
     k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
 
-    secp256k1_t tmps; set_precomputed_basepoint_g(&tmps);
-    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &tmps);
+    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &G_PRECOMP);
 
     // pack pub (x||y) big-endian into thread buffer
     uchar pub[64];
@@ -113,20 +142,20 @@ KERNEL_FQ void vanity_kernel(
 
     // keccak
     uchar digest[32]; keccak256_64(pub, digest);
-    // address = last 20 bytes
-    device uchar *addr = addr_out + gid * 20;
-    for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
-
-    // vanity check: first nibbleCount hex nibbles equal to nibble value
+    // vanity check directly on digest (address = last 20 bytes)
     uint want = params->nibble & 0xF;
     uint nibs = params->nibbleCount;
     bool ok = true;
     for (uint n=0; n<nibs; ++n){
         uint byteIndex = n >> 1; bool high = ((n & 1u) == 0u);
-        uchar b = addr[byteIndex]; uint nib = high ? (b >> 4) : (b & 0xF);
+        uchar b = digest[12 + byteIndex]; uint nib = high ? (b >> 4) : (b & 0xF);
         if (nib != want) { ok = false; break; }
     }
     flags_out[gid] = ok ? (uchar)1 : (uchar)0;
+    if (ok) {
+        device uchar *addr = addr_out + gid * 20;
+        for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
+    }
 }
 '''
         )
@@ -190,7 +219,12 @@ KERNEL_FQ void vanity_kernel(
         enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
 
         w = int(self.thread_execution_width)
-        tpt = min(w, 256)
+        try:
+            max_threads = int(self.pipeline.maxTotalThreadsPerThreadgroup())
+        except Exception:
+            max_threads = 256
+        # Use a multiple of execution width for better occupancy, but respect device limits
+        tpt = min(max_threads, max(w * 4, w))
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
@@ -213,6 +247,11 @@ KERNEL_FQ void vanity_kernel(
             self.out_addr_size = out_addr_size
             self.out_flag_size = out_flag_size
             self.count = count
+            # Async completion signaling
+            self._done_event: threading.Event = threading.Event()
+            self._addrs: Optional[List[bytes]] = None
+            self._flags: Optional[List[int]] = None
+            self._error: Optional[Exception] = None
 
     def encode_and_commit(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJob":
         if not privkeys_be32:
@@ -254,18 +293,34 @@ KERNEL_FQ void vanity_kernel(
         grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
         enc.endEncoding()
-        # Non-blocking submit
+
+        job = MetalVanity.VanityJob(cb, addr_buffer, flags_buffer, out_addr_size, out_flag_size, count)
+
+        # Attach completion handler so results are captured without explicit wait on GPU
+        def _on_completed(inner_cb):
+            try:
+                addr_bytes = bytes(job.addr_buffer.contents().as_buffer(job.out_addr_size)[:job.out_addr_size])
+                flags_bytes = bytes(job.flags_buffer.contents().as_buffer(job.out_flag_size)[:job.out_flag_size])
+                job._addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(job.count)]
+                job._flags = [flags_bytes[i] for i in range(job.count)]
+            except Exception as e:
+                job._error = e
+            finally:
+                job._done_event.set()
+
+        cb.addCompletedHandler_(_on_completed)
+        # Submit
         cb.commit()
 
-        return MetalVanity.VanityJob(cb, addr_buffer, flags_buffer, out_addr_size, out_flag_size, count)
+        return job
 
     def wait_and_collect(self, job: "MetalVanity.VanityJob") -> Tuple[List[bytes], List[int]]:
-        job.cb.waitUntilCompleted()
-        addr_bytes = bytes(job.addr_buffer.contents().as_buffer(job.out_addr_size)[:job.out_addr_size])
-        flags_bytes = bytes(job.flags_buffer.contents().as_buffer(job.out_flag_size)[:job.out_flag_size])
-        addrs = [addr_bytes[i*20:(i+1)*20] for i in range(job.count)]
-        flags = [flags_bytes[i] for i in range(job.count)]
-        return addrs, flags
+        # Wait for asynchronous completion handler to finish copying results
+        job._done_event.wait()
+        if job._error is not None:
+            raise job._error
+        # mypy: these are set once done_event is set
+        return job._addrs or [], job._flags or []
 
 
 def generate_valid_privkeys(batch_size: int) -> List[bytes]:
