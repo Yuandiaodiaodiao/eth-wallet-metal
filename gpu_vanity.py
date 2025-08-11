@@ -23,7 +23,8 @@ class MetalVanity:
         vendor_text = _load_text_no_includes(os.path.join(secp_dir, "inc_vendor.h"))
         src_parts.append(vendor_text)
         src_parts.append("\n#undef DECLSPEC\n#define DECLSPEC inline static\n")
-        src_parts.append("#undef SECP256K1_TMPS_TYPE\n#define SECP256K1_TMPS_TYPE PRIVATE_AS\n")
+        # Use threadgroup memory for precomputed basepoint table
+        src_parts.append("#undef SECP256K1_TMPS_TYPE\n#define SECP256K1_TMPS_TYPE LOCAL_AS\n")
         src_parts.append(_load_text_no_includes(os.path.join(secp_dir, "inc_types.h")))
         src_parts.append("\n")
         src_parts.append(_load_text_no_includes(os.path.join(secp_dir, "inc_ecc_secp256k1.h")))
@@ -85,12 +86,13 @@ inline void keccak256_64(const thread uchar *msg64, thread uchar *out32){
 // params buffer layout
 struct VanityParams { uint count; uint nibble; uint nibbleCount; };
 
-KERNEL_FQ void vanity_kernel(
-    device const uchar *priv_in          [[ buffer(0) ]],
-    device uchar *addr_out               [[ buffer(1) ]],
-    device uchar *flags_out              [[ buffer(2) ]],
-    device const VanityParams *params    [[ buffer(3) ]],
-    uint gid                              [[ thread_position_in_grid ]])
+    KERNEL_FQ void vanity_kernel(
+        device const uchar *priv_in          [[ buffer(0) ]],
+        device uchar *addr_out               [[ buffer(1) ]],
+        device uchar *flags_out              [[ buffer(2) ]],
+        device const VanityParams *params    [[ buffer(3) ]],
+        uint gid                              [[ thread_position_in_grid ]],
+        uint tid                              [[ thread_index_in_threadgroup ]])
 {
     uint count = params->count;
     if (gid >= count) return;
@@ -103,8 +105,17 @@ KERNEL_FQ void vanity_kernel(
     k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
     k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
 
-    secp256k1_t tmps; set_precomputed_basepoint_g(&tmps);
-    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &tmps);
+        // Initialize precomputed basepoint table once per threadgroup
+        threadgroup secp256k1_t tg_tmps;
+        if (tid == 0) {
+            secp256k1_t local_tmp;
+            set_precomputed_basepoint_g(&local_tmp);
+            for (ushort i = 0; i < SECP256K1_PRE_COMPUTED_XY_SIZE; ++i) {
+                tg_tmps.xy[i] = local_tmp.xy[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &tg_tmps);
 
     // pack pub (x||y) big-endian into thread buffer
     uchar pub[64];
