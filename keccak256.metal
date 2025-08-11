@@ -36,14 +36,18 @@ inline void keccak_f1600(thread ulong a[25]) {
     ulong c[5];
     ulong d[5];
 
+    #pragma unroll
     for (ushort round = 0; round < 24; ++round) {
         // Theta
+        #pragma unroll
         for (ushort x = 0; x < 5; ++x) {
             c[x] = a[x + 0] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
         }
+        #pragma unroll
         for (ushort x = 0; x < 5; ++x) {
             d[x] = rotl64(c[(x + 1) % 5], 1) ^ c[(x + 4) % 5];
         }
+        #pragma unroll
         for (ushort y = 0; y < 5; ++y) {
             ushort yy = y * 5;
             a[yy + 0] ^= d[0];
@@ -54,7 +58,9 @@ inline void keccak_f1600(thread ulong a[25]) {
         }
 
         // Rho + Pi: b[x',y'] = ROT(a[x,y], RHO[x,y]) where x' = y, y' = (2x + 3y) mod 5
+        #pragma unroll
         for (ushort y = 0; y < 5; ++y) {
+            #pragma unroll
             for (ushort x = 0; x < 5; ++x) {
                 ushort idx = x + 5 * y;
                 ushort xp = y;
@@ -64,6 +70,7 @@ inline void keccak_f1600(thread ulong a[25]) {
         }
 
         // Chi
+        #pragma unroll
         for (ushort y = 0; y < 5; ++y) {
             ushort yy = y * 5;
             ulong b0 = b[yy + 0];
@@ -86,6 +93,7 @@ inline void keccak_f1600(thread ulong a[25]) {
 // Helper: load 64-bit little-endian from 8 bytes
 inline ulong load64_device(const device uchar *src) {
     ulong v = 0;
+    #pragma unroll
     for (ushort i = 0; i < 8; ++i) {
         v |= ((ulong)src[i]) << (8 * i);
     }
@@ -94,6 +102,7 @@ inline ulong load64_device(const device uchar *src) {
 
 // Helper: store 64-bit little-endian to 8 bytes
 inline void store64(ulong v, device uchar *dst) {
+    #pragma unroll
     for (ushort i = 0; i < 8; ++i) {
         dst[i] = (uchar)((v >> (8 * i)) & 0xFF);
     }
@@ -102,6 +111,7 @@ inline void store64(ulong v, device uchar *dst) {
 // Helper: load 64-bit from thread address space
 inline ulong load64_thread(const thread uchar *src) {
     ulong v = 0;
+    #pragma unroll
     for (ushort i = 0; i < 8; ++i) {
         v |= ((ulong)src[i]) << (8 * i);
     }
@@ -111,41 +121,33 @@ inline ulong load64_thread(const thread uchar *src) {
 kernel void keccak256_kernel(
     device const uchar *inBytes           [[ buffer(0) ]],  // 64-byte input per thread
     device uchar *outBytes                [[ buffer(1) ]],  // 32-byte output per thread
-    device const uint *countPtr           [[ buffer(2) ]],  // total number of items
     uint gid                               [[ thread_position_in_grid ]])
 {
-    uint count = *countPtr;
-    if (gid >= count) {
-        return;
-    }
     // We process exactly one 64-byte message per thread
     const device uchar *msg = inBytes + (gid * 64);
     device uchar *out = outBytes + (gid * 32);
 
     // Initialize state (25 lanes = 200 bytes)
     ulong A[25];
+    #pragma unroll
     for (ushort i = 0; i < 25; ++i) A[i] = 0UL;
 
-    // Absorb 64-byte message into first 136 bytes (rate) with Keccak padding (0x01 ... 0x80)
-    uchar block[136];
-    for (ushort i = 0; i < 136; ++i) block[i] = 0;
-    for (ushort i = 0; i < 64; ++i) block[i] = msg[i];
-    block[64] ^= 0x01;     // Keccak (Ethereum) domain separation bit
-    block[135] ^= 0x80;    // final bit of pad10*1
-
-    // XOR block into state (as bytes -> lanes little-endian)
-    // Load as 17 lanes (136 bytes) into A[0..16]
-    for (ushort i = 0; i < 17; ++i) {
-        const thread uchar* lanePtr = block + (i * 8);
-        A[i] ^= load64_thread(lanePtr);
+    // Directly absorb 64-byte message (little-endian) into lanes A[0..7]
+    #pragma unroll
+    for (ushort i = 0; i < 8; ++i) {
+        A[i] ^= load64_device(msg + (i * 8));
     }
+    // Keccak padding for 64-byte message within rate (136B)
+    // XOR domain separation bit at byte 64 -> lane 8, bit 0
+    A[8] ^= 0x01UL;
+    // Final bit of pad10*1 at byte 135 bit 7 -> lane 16, bit 63
+    A[16] ^= 0x8000000000000000UL;
 
     // Permutation
     keccak_f1600(A);
 
     // Squeeze first 32 bytes of the state (little-endian of lanes 0..3)
-    // Write to out
-    // Lane 0..3 gives 32 bytes
+    #pragma unroll
     for (ushort i = 0; i < 4; ++i) {
         store64(A[i], out + (i * 8));
     }

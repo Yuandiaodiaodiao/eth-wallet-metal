@@ -103,13 +103,16 @@ inline void keccak_f1600_inline(thread ulong a[25]) {
 inline ulong load64_thread(const thread uchar *src){ ulong v=0; for(ushort i=0;i<8;++i) v|=((ulong)src[i])<<(8*i); return v; }
 inline void store64_le(ulong v, thread uchar *dst){ for(ushort i=0;i<8;++i) dst[i]=(uchar)((v>>(8*i))&0xFF); }
 inline void keccak256_64(const thread uchar *msg64, thread uchar *out32){
-    ulong A[25]; for(ushort i=0;i<25;++i) A[i]=0UL;
-    uchar block[136]; for(ushort i=0;i<136;++i) block[i]=0; for(ushort i=0;i<64;++i) block[i]=msg64[i];
-    block[64]^=0x01; block[135]^=0x80;
-    for(ushort i=0;i<17;++i){ const thread uchar* lane = block + i*8; A[i]^=load64_thread(lane); }
+    ulong A[25];
+    for (ushort i=0;i<25;++i) A[i]=0UL;
+    // absorb 64 bytes directly into lanes 0..7 (little-endian words)
+    for (ushort i=0;i<8;++i) { A[i] ^= load64_thread(msg64 + (i*8)); }
+    // padding for 64-byte message within 136-byte rate
+    A[8] ^= 0x01UL;                 // domain separation bit at byte 64
+    A[16] ^= 0x8000000000000000UL;  // final bit at byte 135
     keccak_f1600_inline(A);
-    // squeeze first 32 bytes little-endian of lanes 0..3
-    for(ushort i=0;i<4;++i){ store64_le(A[i], out32 + i*8); }
+    // squeeze first 32 bytes (lanes 0..3) little-endian
+    for (ushort i=0;i<4;++i){ store64_le(A[i], out32 + i*8); }
 }
 
 // params buffer layout
@@ -146,15 +149,71 @@ KERNEL_FQ void vanity_kernel(
     uint want = params->nibble & 0xF;
     uint nibs = params->nibbleCount;
     bool ok = true;
-    for (uint n=0; n<nibs; ++n){
-        uint byteIndex = n >> 1; bool high = ((n & 1u) == 0u);
-        uchar b = digest[12 + byteIndex]; uint nib = high ? (b >> 4) : (b & 0xF);
-        if (nib != want) { ok = false; break; }
+    uchar want_byte = (uchar)((want << 4) | want);
+    uint full = nibs >> 1;            // number of full bytes to check
+    uint rem = nibs & 1u;             // 1 if one extra high nibble
+    for (uint i = 0; i < full; ++i) {
+        if (digest[12 + i] != want_byte) { ok = false; break; }
+    }
+    if (ok && rem) {
+        uchar b = digest[12 + full];
+        if ((b >> 4) != want) ok = false;
     }
     flags_out[gid] = ok ? (uchar)1 : (uchar)0;
     if (ok) {
         device uchar *addr = addr_out + gid * 20;
         for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
+    }
+}
+
+// Compact-output variant: write matches only using atomic compaction
+KERNEL_FQ void vanity_kernel_compact(
+    device const uchar *priv_in              [[ buffer(0) ]],
+    device uchar *addr_compact_out           [[ buffer(1) ]],
+    device uint *index_compact_out           [[ buffer(2) ]],
+    device atomic_uint *out_count            [[ buffer(3) ]],
+    device const VanityParams *params        [[ buffer(4) ]],
+    uint gid                                 [[ thread_position_in_grid ]])
+{
+    uint count = params->count;
+    if (gid >= count) return;
+    const device uchar *p = priv_in + gid * 32;
+
+    // load priv big-endian -> limbs
+    u32 k_be[8];
+    for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
+    u32 k_local[8];
+    k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
+    k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
+
+    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &G_PRECOMP);
+
+    // pack pub (x||y) big-endian into thread buffer
+    uchar pub[64];
+    for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+    for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+
+    // keccak
+    uchar digest[32]; keccak256_64(pub, digest);
+    // vanity check directly on digest (address = last 20 bytes)
+    uint want = params->nibble & 0xF;
+    uint nibs = params->nibbleCount;
+    bool ok = true;
+    uchar want_byte = (uchar)((want << 4) | want);
+    uint full = nibs >> 1;            // number of full bytes to check
+    uint rem = nibs & 1u;             // 1 if one extra high nibble
+    for (uint i = 0; i < full; ++i) {
+        if (digest[12 + i] != want_byte) { ok = false; break; }
+    }
+    if (ok && rem) {
+        uchar b = digest[12 + full];
+        if ((b >> 4) != want) ok = false;
+    }
+    if (ok) {
+        uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+        device uchar *addr = addr_compact_out + idx * 20;
+        for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
+        index_compact_out[idx] = gid;
     }
 }
 '''
@@ -169,17 +228,30 @@ KERNEL_FQ void vanity_kernel(
         fn = library.newFunctionWithName_("vanity_kernel")
         if fn is None:
             raise RuntimeError("vanity_kernel not found")
+        fn_compact = library.newFunctionWithName_("vanity_kernel_compact")
+        if fn_compact is None:
+            raise RuntimeError("vanity_kernel_compact not found")
 
         pipeline, error = self.device.newComputePipelineStateWithFunction_error_(fn, None)
         if pipeline is None:
             raise RuntimeError(f"Failed to create pipeline: {error}")
+        pipeline_compact, error = self.device.newComputePipelineStateWithFunction_error_(fn_compact, None)
+        if pipeline_compact is None:
+            raise RuntimeError(f"Failed to create compact pipeline: {error}")
 
         self.pipeline = pipeline
-        # Use two distinct command queues and alternate to avoid sharing a single queue's buffer lifecycle
-        self.queue_a = self.device.newCommandQueue()
-        self.queue_b = self.device.newCommandQueue()
-        self._use_queue_a = True
+        self.pipeline_compact = pipeline_compact
+        # Single command queue is sufficient; command buffers pipeline naturally
+        self.queue = self.device.newCommandQueue()
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
+        # Reusable buffers for synchronous path to reduce allocations
+        self._rb_in = None
+        self._rb_addr = None
+        self._rb_flags = None
+        self._rb_params = None
+        self._rb_in_cap = 0
+        self._rb_addr_cap = 0
+        self._rb_flags_cap = 0
 
     def run_batch(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> Tuple[List[bytes], List[int]]:
         if not privkeys_be32:
@@ -192,10 +264,22 @@ KERNEL_FQ void vanity_kernel(
         out_addr_size = 20 * count
         out_flag_size = count
 
-        in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
-        addr_buffer = self.device.newBufferWithLength_options_(out_addr_size, 0)
-        flags_buffer = self.device.newBufferWithLength_options_(out_flag_size, 0)
-        params_buffer = self.device.newBufferWithLength_options_(12, 0)
+        # Ensure reusable buffers
+        if self._rb_in is None or self._rb_in_cap < in_size:
+            self._rb_in = self.device.newBufferWithLength_options_(in_size, 0)
+            self._rb_in_cap = in_size
+        if self._rb_addr is None or self._rb_addr_cap < out_addr_size:
+            self._rb_addr = self.device.newBufferWithLength_options_(out_addr_size, 0)
+            self._rb_addr_cap = out_addr_size
+        if self._rb_flags is None or self._rb_flags_cap < out_flag_size:
+            self._rb_flags = self.device.newBufferWithLength_options_(out_flag_size, 0)
+            self._rb_flags_cap = out_flag_size
+        if self._rb_params is None:
+            self._rb_params = self.device.newBufferWithLength_options_(12, 0)
+        in_buffer = self._rb_in
+        addr_buffer = self._rb_addr
+        flags_buffer = self._rb_flags
+        params_buffer = self._rb_params
 
         joined = b"".join(privkeys_be32)
         in_buffer.contents().as_buffer(in_size)[:in_size] = joined
@@ -207,10 +291,7 @@ KERNEL_FQ void vanity_kernel(
         p[8:12] = int(nibble_count).to_bytes(4, "little")
         params_buffer.contents().as_buffer(12)[:12] = bytes(p)
 
-        # Alternate command queues between jobs
-        q = self.queue_a if self._use_queue_a else self.queue_b
-        self._use_queue_a = not self._use_queue_a
-        cb = q.commandBuffer()
+        cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
         enc.setComputePipelineState_(self.pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
@@ -277,9 +358,7 @@ KERNEL_FQ void vanity_kernel(
         p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
         p[8:12] = int(nibble_count).to_bytes(4, "little")
         params_buffer.contents().as_buffer(12)[:12] = bytes(p)
-        q = self.queue_a if self._use_queue_a else self.queue_b
-        self._use_queue_a = not self._use_queue_a
-        cb = q.commandBuffer()
+        cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
         enc.setComputePipelineState_(self.pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
@@ -288,7 +367,12 @@ KERNEL_FQ void vanity_kernel(
         enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
 
         w = int(self.thread_execution_width)
-        tpt = min(w, 256)
+        try:
+            max_threads = int(self.pipeline.maxTotalThreadsPerThreadgroup())
+        except Exception:
+            max_threads = 256
+        # Use a multiple of execution width for better occupancy, but respect device limits
+        tpt = min(max_threads, max(w * 4, w))
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(((count + tpt - 1) // tpt) * tpt, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)

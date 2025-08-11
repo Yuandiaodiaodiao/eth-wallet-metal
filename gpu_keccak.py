@@ -39,6 +39,13 @@ class MetalKeccak256:
             raise RuntimeError("Failed to create Metal command queue")
 
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
+        self.max_threads_per_tg = getattr(self.pipeline, "maxTotalThreadsPerThreadgroup")()
+
+        # Reusable buffers to reduce allocation overhead
+        self._in_buffer = None
+        self._out_buffer = None
+        self._in_capacity = 0
+        self._out_capacity = 0
 
     def keccak256_many(self, inputs: List[bytes]) -> List[bytes]:
         if not inputs:
@@ -52,39 +59,38 @@ class MetalKeccak256:
         in_size = 64 * count
         out_size = 32 * count
 
-        # Allocate buffers
-        in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
-        out_buffer = self.device.newBufferWithLength_options_(out_size, 0)
-        count_buffer = self.device.newBufferWithLength_options_(ctypes.sizeof(ctypes.c_uint), 0)
-        if in_buffer is None or out_buffer is None:
+        # Ensure and reuse buffers
+        if self._in_buffer is None or self._in_capacity < in_size:
+            self._in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
+            self._in_capacity = in_size
+        if self._out_buffer is None or self._out_capacity < out_size:
+            self._out_buffer = self.device.newBufferWithLength_options_(out_size, 0)
+            self._out_capacity = out_size
+        if self._in_buffer is None or self._out_buffer is None:
             raise RuntimeError("Failed to allocate Metal buffers")
-        if count_buffer is None:
-            raise RuntimeError("Failed to allocate Metal count buffer")
 
         # Copy input bytes into GPU buffer
         # Concatenate inputs
         joined = b"".join(inputs)
-        in_mv = in_buffer.contents().as_buffer(in_size)
+        in_mv = self._in_buffer.contents().as_buffer(in_size)
         in_mv[:in_size] = joined
 
         # Build and encode compute command
         command_buffer = self.queue.commandBuffer()
         encoder = command_buffer.computeCommandEncoder()
         encoder.setComputePipelineState_(self.pipeline)
-        encoder.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(out_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(count_buffer, 0, 2)
-
-        # Write count to buffer
-        count_mv = count_buffer.contents().as_buffer(4)
-        count_mv[:4] = int(count).to_bytes(4, "little")
+        encoder.setBuffer_offset_atIndex_(self._in_buffer, 0, 0)
+        encoder.setBuffer_offset_atIndex_(self._out_buffer, 0, 1)
 
         # Grid config: one thread per item
         w = int(self.thread_execution_width)
-        threads_per_tg = min(w, 256)
+        # choose the largest multiple of execution width that fits the device limit, max 512 for safety
+        limit = int(self.max_threads_per_tg) if self.max_threads_per_tg else 512
+        threads_per_tg = min(max(w, 1) * max(1, (limit // max(w, 1))), limit)
+        if threads_per_tg == 0:
+            threads_per_tg = w or 64
         tg_size = MTLSizeMake(threads_per_tg, 1, 1)
-        num_tg = (count + threads_per_tg - 1) // threads_per_tg
-        grid = MTLSizeMake(num_tg * threads_per_tg, 1, 1)
+        grid = MTLSizeMake(count, 1, 1)
         encoder.dispatchThreads_threadsPerThreadgroup_(grid, tg_size)
         encoder.endEncoding()
 
@@ -92,7 +98,7 @@ class MetalKeccak256:
         command_buffer.waitUntilCompleted()
 
         # Read back results
-        out_mv = out_buffer.contents().as_buffer(out_size)
+        out_mv = self._out_buffer.contents().as_buffer(out_size)
         out_bytes = bytes(out_mv[:out_size])
         return [out_bytes[i * 32 : (i + 1) * 32] for i in range(count)]
 
