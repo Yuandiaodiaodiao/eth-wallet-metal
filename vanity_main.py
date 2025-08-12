@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
+def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 3, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
@@ -32,7 +32,7 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, m
         job_next = engine.encode_and_commit_walk_compact(privs_next, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
 
         # Now wait and collect the previous job while the next one is queued/running
-        addrs, indices = engine.wait_and_collect_compact(job_prev)
+        addrs, indices, steps_effective = engine.wait_and_collect_compact(job_prev)
         total_keys += batch_size * steps_per_thread
         avg_elapsed = max(time.perf_counter() - start_time, 1e-9)
         avg_rate = total_keys / avg_elapsed
@@ -53,8 +53,9 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, m
 
         if indices:
             idx = indices[0]
-            gid = idx // steps_per_thread
-            off = idx % steps_per_thread
+            # Use the steps used by the GPU job that produced this result
+            gid = idx // max(1, steps_effective)
+            off = idx % max(1, steps_effective)
             base = int.from_bytes(privs_prev[gid], "big")
             k = base + off
             n = SECP256K1_ORDER_INT
@@ -62,9 +63,15 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, m
                 k -= n
             if k == 0:
                 k = 1
+            k_bytes = k.to_bytes(32, "big")
+            # Verify address for this priv using a direct compact kernel call
+            verify_job = engine.encode_and_commit_compact([k_bytes], nibble=0x0, nibble_count=0)
+            v_addrs, v_indices, _ = engine.wait_and_collect_compact(verify_job)
+            out_addr = addrs[0]
+            verified_addr = v_addrs[0] if v_addrs else b""
             print("FOUND:")
-            print("priv:", k.to_bytes(32, "big").hex())
-            print("addr:", hex_addr(addrs[0]))
+            print("priv:", k_bytes.hex())
+            print("addr:", hex_addr(verified_addr or out_addr))
             return
         # Shift next -> prev for the next iteration
         privs_prev = privs_next

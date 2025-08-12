@@ -788,6 +788,8 @@ KERNEL_FQ void vanity_kernel_compact(
             self.index_compact_buffer = index_compact_buffer
             self.out_count_buffer = out_count_buffer
             self.capacity_count = capacity_count
+            # Encoded steps per thread used by the kernel that produced indices
+            self.effective_steps_per_thread: int = 1
             self._done_event: threading.Event = threading.Event()
             self._addrs: Optional[List[bytes]] = None
             self._indices: Optional[List[int]] = None
@@ -863,6 +865,7 @@ KERNEL_FQ void vanity_kernel_compact(
         enc.endEncoding()
 
         job = MetalVanity.VanityJobCompact(cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, count)
+        job.effective_steps_per_thread = 1
 
         def _on_completed(inner_cb):
             try:
@@ -893,11 +896,11 @@ KERNEL_FQ void vanity_kernel_compact(
         job.cpu_encode_seconds = time.perf_counter() - t_cpu0
         return job
 
-    def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int]]:
+    def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int], int]:
         job._done_event.wait()
         if job._error is not None:
             raise job._error
-        return job._addrs or [], job._indices or []
+        return job._addrs or [], job._indices or [], job.effective_steps_per_thread
 
 
     def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
@@ -970,6 +973,7 @@ KERNEL_FQ void vanity_kernel_compact(
         enc.endEncoding()
 
         job = MetalVanity.VanityJobCompact(cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, capacity_count)
+        job.effective_steps_per_thread = int(steps_per_thread)
 
         def _on_completed(inner_cb):
             try:
