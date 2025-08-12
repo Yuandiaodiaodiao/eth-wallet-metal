@@ -1,33 +1,15 @@
 import os
 import time
-import secrets
 import threading
-import math
 from typing import List, Tuple, Optional
 
-# Precompute curve order bytes once to speed privkey validity checks
-try:
-    from ecdsa import SECP256k1  # type: ignore
-    SECP256K1_ORDER_BYTES = SECP256k1.order.to_bytes(32, "big")
-except Exception:  # Fallback if ecdsa not importable at import-time
-    SECP256K1_ORDER_BYTES = int(
-        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    ).to_bytes(32, "big")
-
-ZERO_32 = b"\x00" * 32
-
 from Metal import MTLCreateSystemDefaultDevice, MTLSizeMake
+from g16_table import build_g16_table
 
-# Integer curve order for fast modular arithmetic
-SECP256K1_ORDER_INT = int.from_bytes(SECP256K1_ORDER_BYTES, "big")
-
-# Optional NumPy acceleration (SIMD on Apple Silicon)
-try:
-    import numpy as np  # type: ignore
-
-    HAS_NUMPY = True
-except Exception:  # Optional dependency
-    HAS_NUMPY = False
+# Make build_g16_table available as a method
+def _build_g16_table_method(self, repo_root: str) -> None:
+    """Wrapper to make build_g16_table available as a method"""
+    build_g16_table(self, repo_root)
 
 
 def _load_text_no_includes(path: str) -> str:
@@ -37,6 +19,8 @@ def _load_text_no_includes(path: str) -> str:
 
 
 class MetalVanity:
+    # Add build_g16_table method
+    build_g16_table = _build_g16_table_method
     def __init__(self, repo_root: str) -> None:
         self.device = MTLCreateSystemDefaultDevice()
         if self.device is None:
@@ -401,87 +385,6 @@ KERNEL_FQ void vanity_kernel_compact(
         for (ushort i=0;i<8;++i){ gy[i] = G_PRECOMP.xy[8 + i]; }
     }
 
-    // Sliding window batch processing function for walker
-    // Processes up to BATCH_WINDOW_SIZE steps at a time using stack arrays
-    inline void process_walker_batch(
-        thread u32 *base_x, thread u32 *base_y, thread u32 *base_z,
-        thread const u32 *dx, thread const u32 *dy,
-        uint batch_start, uint batch_size, uint total_steps,
-        device uchar *addr_compact_out, device uint *index_compact_out, 
-        device atomic_uint *out_count, uint gid, uint want, uint nibs) 
-    {
-        // Stack arrays for this batch - fixed size to avoid overflow
-        u32 xs[BATCH_WINDOW_SIZE][8];
-        u32 ys[BATCH_WINDOW_SIZE][8]; 
-        u32 zs[BATCH_WINDOW_SIZE][8];
-        u32 pref[BATCH_WINDOW_SIZE][8];
-        
-        // Start from base point for this batch
-        u32 xj[8], yj[8], zj[8];
-        for (ushort i=0;i<8;++i){ xj[i]=base_x[i]; yj[i]=base_y[i]; zj[i]=base_z[i]; }
-        
-        // Generate batch_size points by repeated addition
-        for (uint i=0; i<batch_size; ++i){
-            for (ushort k=0;k<8;++k){ xs[i][k]=xj[k]; ys[i][k]=yj[k]; zs[i][k]=zj[k]; }
-            // Copy dx, dy to non-const arrays for point_add
-            u32 temp_dx[8], temp_dy[8];
-            for (ushort k=0;k<8;++k){ temp_dx[k]=dx[k]; temp_dy[k]=dy[k]; }
-            point_add(xj, yj, zj, temp_dx, temp_dy);
-        }
-        
-        // Update base point for next batch
-        for (ushort i=0;i<8;++i){ base_x[i]=xj[i]; base_y[i]=yj[i]; base_z[i]=zj[i]; }
-        
-        // Batch inversion using Montgomery trick
-        for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
-        for (uint i=1; i<batch_size; ++i){
-            mul_mod(pref[i], pref[i-1], zs[i]);
-        }
-        
-        // Inverse total
-        u32 inv_total[8];
-        for (ushort k=0;k<8;++k){ inv_total[k] = pref[batch_size-1][k]; }
-        inv_mod(inv_total);
-        
-        // Backward pass and vanity check
-        for (int ii=(int)batch_size-1; ii>=0; --ii){
-            u32 inv_z[8];
-            if (ii == 0){
-                for (ushort k=0;k<8;++k){ inv_z[k]=inv_total[k]; }
-            } else {
-                mul_mod(inv_z, inv_total, pref[ii-1]);
-            }
-            mul_mod(inv_total, inv_total, zs[ii]);
-            
-            // Convert to affine coordinates
-            u32 z2[8]; for (ushort k=0;k<8;++k) z2[k]=inv_z[k];
-            mul_mod(z2, z2, z2);
-            u32 xa[8]; for (ushort k=0;k<8;++k) xa[k]=xs[ii][k]; mul_mod(xa, xa, z2);
-            u32 z3[8]; mul_mod(z3, z2, inv_z);
-            u32 ya[8]; for (ushort k=0;k<8;++k) ya[k]=ys[ii][k]; mul_mod(ya, ya, z3);
-            
-            // Pack public key and compute Keccak
-            uchar pub[64];
-            for (ushort k=0;k<8;++k){ u32 w=xa[7-k]; ushort off=k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-            for (ushort k=0;k<8;++k){ u32 w=ya[7-k]; ushort off=32+k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-            
-            uchar digest[32]; keccak256_64(pub, digest);
-            
-            // Vanity check
-            bool ok = true;
-            uchar want_byte = (uchar)((want << 4) | want);
-            uint full = nibs >> 1; uint rem = nibs & 1u;
-            for (uint b = 0; b < full; ++b) { if (digest[12 + b] != want_byte) { ok = false; break; } }
-            if (ok && rem) { uchar bb = digest[12 + full]; if ((bb >> 4) != want) ok = false; }
-            
-            if (ok){
-                uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                device uchar *addr = addr_compact_out + idx * 20;
-                for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
-                index_compact_out[idx] = gid * total_steps + batch_start + (uint)ii;
-            }
-        }
-    }
 
     // Non-w16 walker (fallback): uses point_mul_xy with precomputed G
     KERNEL_FQ void vanity_kernel_walk_compact(
@@ -513,14 +416,87 @@ KERNEL_FQ void vanity_kernel_compact(
         u32 base_x[8], base_y[8], base_z[8];
         for (ushort i=0;i<8;++i){ base_x[i]=x0[i]; base_y[i]=y0[i]; base_z[i]=0; }
         base_z[0]=1;
-
+ // Stack arrays for this batch - fixed size to avoid overflow
+        u32 xs[BATCH_WINDOW_SIZE][8];
+        u32 ys[BATCH_WINDOW_SIZE][8]; 
+        u32 zs[BATCH_WINDOW_SIZE][8];
+        u32 pref[BATCH_WINDOW_SIZE][8];
         // Process in batches of BATCH_WINDOW_SIZE to avoid stack overflow
         uint processed = 0;
         while (processed < steps) {
-            uint batch_size = (steps - processed > BATCH_WINDOW_SIZE) ? BATCH_WINDOW_SIZE : (steps - processed);
-            process_walker_batch(base_x, base_y, base_z, dx, dy, processed, batch_size, steps,
-                                addr_compact_out, index_compact_out, out_count, gid, want, nibs);
-            processed += batch_size;
+            
+            // Inline batch processing to avoid function call overhead
+            {
+               
+                
+                // Start from base point for this batch
+                
+                // Generate batch_size points by repeated addition
+                for (uint i=0; i<BATCH_WINDOW_SIZE; ++i){
+                    for (ushort k=0;k<8;++k){ xs[i][k]=base_x[k]; ys[i][k]=base_y[k]; zs[i][k]=base_z[k]; }
+                    point_add(base_x, base_y, base_z, dx, dy);
+                }
+                
+                
+                // Batch inversion using Montgomery trick
+                for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
+                for (uint i=1; i<BATCH_WINDOW_SIZE; ++i){
+                    mul_mod(pref[i], pref[i-1], zs[i]);
+                }
+                
+                // Inverse total
+                u32 inv_total[8];
+                for (ushort k=0;k<8;++k){ inv_total[k] = pref[BATCH_WINDOW_SIZE-1][k]; }
+                inv_mod(inv_total);
+                
+                // Backward pass and vanity check
+                for (int ii=(int)BATCH_WINDOW_SIZE-1; ii>=0; --ii){
+                    u32 inv_z[8];
+                    if (ii == 0){
+                        for (ushort k=0;k<8;++k){ inv_z[k]=inv_total[k]; }
+                    } else {
+                        mul_mod(inv_z, inv_total, pref[ii-1]);
+                    }
+                    mul_mod(inv_total, inv_total, zs[ii]);
+                    
+                    // Convert to affine coordinates
+                    u32 z2[8]; for (ushort k=0;k<8;++k) z2[k]=inv_z[k];
+                    mul_mod(z2, z2, z2);
+                    u32 xa[8]; for (ushort k=0;k<8;++k) xa[k]=xs[ii][k]; mul_mod(xa, xa, z2);
+                    u32 z3[8]; mul_mod(z3, z2, inv_z);
+                    u32 ya[8]; for (ushort k=0;k<8;++k) ya[k]=ys[ii][k]; mul_mod(ya, ya, z3);
+                    
+                    // Pack public key and compute Keccak
+                    uchar pub[64];
+                    for (ushort k=0;k<8;++k){ u32 w=xa[7-k]; ushort off=k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+                    for (ushort k=0;k<8;++k){ u32 w=ya[7-k]; ushort off=32+k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+                    
+                    uchar digest[32]; 
+                    
+                    keccak256_64(pub, digest);
+                    
+                    // Vanity check
+                    bool ok = true;
+                    uchar want_byte = (uchar)((want << 4) | want);
+                    uint full = nibs >> 1; 
+                    uint rem = nibs & 1u;
+                    for (uint b = 0; b < full; ++b) {
+                     if (digest[12 + b] != want_byte) { ok = false; break; } 
+                    }
+                    if (ok && rem) { 
+                    if ((digest[12 + full] >> 4) != want) ok = false; 
+                    }
+                    
+                    if (ok){
+                        uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                        // device uchar *addr = addr_compact_out + idx * 20;
+                        // for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
+                        index_compact_out[idx] = gid * steps + processed + (uint)ii;
+                    }
+                }
+            }
+            
+            processed += BATCH_WINDOW_SIZE;
         }
     }
 
@@ -597,52 +573,6 @@ KERNEL_FQ void vanity_kernel_compact(
         except Exception:
             self.g16_buffer = None
 
-    def build_g16_table(self, repo_root: str) -> None:
-        # Build g16 table entirely on GPU; writes to memory, caller can persist to file if desired
-        if self.pipeline_builder is None:
-            raise RuntimeError("g16_builder_kernel pipeline not available")
-        total_bytes = 16 * 65536 * 64
-        if self.g16_buffer is None or int(self.g16_buffer.length()) != total_bytes:
-            self.g16_buffer = self.device.newBufferWithLength_options_(total_bytes, 0)
-        # Build per window in chunks to avoid absurd dispatch sizes
-        for win in range(16):
-            start = 0
-            while start < 65536:
-                chunk = min(65536 - start, 32768)  # at most 32k threads per dispatch
-                params = bytearray(8)
-                params[0:4] = int(win).to_bytes(4, "little")
-                params[4:8] = int(start).to_bytes(4, "little")
-                cb = self.queue.commandBuffer()
-                enc = cb.computeCommandEncoder()
-                enc.setComputePipelineState_(self.pipeline_builder)
-                enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 0)
-                try:
-                    enc.setBytes_length_atIndex_(bytes(params), 8, 1)
-                except Exception:
-                    pbuf = self.device.newBufferWithLength_options_(8, 0)
-                    pbuf.contents().as_buffer(8)[:8] = bytes(params)
-                    enc.setBuffer_offset_atIndex_(pbuf, 0, 1)
-                w = int(self.thread_execution_width)
-                try:
-                    max_threads = int(self.pipeline_builder.maxTotalThreadsPerThreadgroup())
-                except Exception:
-                    max_threads = 256
-                tpt = min(max_threads, max(w * 4, w), max(1, chunk))
-                tg = MTLSizeMake(tpt, 1, 1)
-                grid = MTLSizeMake(chunk, 1, 1)
-                enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
-                enc.endEncoding()
-                cb.commit()
-                cb.waitUntilCompleted()  # sequential to limit VRAM pressure while building
-                start += chunk
-        # Optionally write to disk for future runs
-        try:
-            path = os.path.join(repo_root, "gen_eth", "secp256k1", "g16_precomp_le.bin")
-            with open(path, "wb") as f:
-                mv = self.g16_buffer.contents().as_buffer(total_bytes)
-                f.write(bytes(mv[:total_bytes]))
-        except Exception:
-            pass
    # --- Pipelined API ---
     class VanityJob:
         def __init__(self, cb, addr_buffer, flags_buffer, out_addr_size: int, out_flag_size: int, count: int):
@@ -663,13 +593,6 @@ KERNEL_FQ void vanity_kernel_compact(
             self.gpu_end_time: float = -1.0
 
     
-    def wait_and_collect(self, job: "MetalVanity.VanityJob") -> Tuple[List[bytes], List[int]]:
-        # Wait for asynchronous completion handler to finish copying results
-        job._done_event.wait()
-        if job._error is not None:
-            raise job._error
-        # mypy: these are set once done_event is set
-        return job._addrs or [], job._flags or []
 
     # --- Compact-output pipelined API ---
     class VanityJobCompact:
@@ -906,217 +829,3 @@ KERNEL_FQ void vanity_kernel_compact(
         cb.commit()
         job.cpu_encode_seconds = time.perf_counter() - t_cpu0
         return job
-def generate_valid_privkeys(batch_size: int, steps_per_thread: int = 1, seq_len: int = 8192) -> List[bytes]:
-    # Fast incremental generator to remove RNG bottleneck.
-    if HAS_NUMPY:
-        return _generate_privkeys_incremental_numpy(batch_size, steps_per_thread, seq_len)
-    raise NotImplementedError("NumPy is not installed")
-
-def _generate_privkeys_incremental_python(batch_size: int, seq_len: int = 8192) -> List[bytes]:
-    out: List[bytes] = []
-    n = SECP256K1_ORDER_INT
-    num_bases = math.ceil(batch_size / seq_len)
-    for _ in range(num_bases):
-        base = int.from_bytes(secrets.token_bytes(32), "big") % n
-        if base == 0:
-            base = 1
-        # Derive a run of consecutive scalars in [1, n-1]
-        for i in range(seq_len):
-            k = base + i
-            if k >= n:
-                k -= n
-            if k == 0:
-                k = 1
-            out.append(k.to_bytes(32, "big"))
-            if len(out) >= batch_size:
-                return out
-    return out
-
-
-def _generate_privkeys_incremental_numpy(batch_size: int, steps_per_thread: int = 1, seq_len: int = 8192) -> List[bytes]:  # heavy vector path
-    import numpy as np  # type: ignore
-
-    # Build n as little-endian u64 limbs [w0,w1,w2,w3]
-    n_be_u64 = np.frombuffer(SECP256K1_ORDER_BYTES, dtype=np.dtype('>u8')).reshape(4)
-    n_le_u64 = n_be_u64[::-1].byteswap().view(np.dtype('<u8'))
-
-    # Convert steps_per_thread to little-endian u64 limbs
-    step_int = steps_per_thread % SECP256K1_ORDER_INT
-    if step_int == 0:
-        step_int = 1
-    step_bytes = step_int.to_bytes(32, "big")
-    step_be_u64 = np.frombuffer(step_bytes, dtype=np.dtype('>u8')).reshape(4)
-    step_le_u64 = step_be_u64[::-1].byteswap().view(np.dtype('<u8'))
-
-    # Calculate number of base keys needed
-    num_bases = int(math.ceil(batch_size / seq_len))
-    
-    # Generate multiple large random bases (256 bytes each for maximum security)
-    # This provides much more entropy than 32-byte bases
-    large_base_bytes = 256  # 2048 bits of entropy per base
-    rnd = secrets.token_bytes(large_base_bytes * num_bases)
-    
-    # Convert large random numbers to secp256k1 field elements
-    base_le = np.zeros((num_bases, 4), dtype=np.uint64)
-    for i in range(num_bases):
-        # Take 256 bytes of randomness for each base
-        large_rnd = rnd[i * large_base_bytes : (i + 1) * large_base_bytes]
-        
-        # Interpret as big integer and reduce modulo n
-        large_int = int.from_bytes(large_rnd, "big")
-        reduced_int = large_int % SECP256K1_ORDER_INT
-        if reduced_int == 0:
-            reduced_int = 1
-            
-        # Convert to little-endian u64 limbs
-        reduced_bytes = reduced_int.to_bytes(32, "big")
-        reduced_be_u64 = np.frombuffer(reduced_bytes, dtype=np.dtype('>u8')).reshape(4)
-        base_le[i] = reduced_be_u64[::-1].byteswap().view(np.dtype('<u8'))
-
-    # 64x64->128 multiply helper
-    def mul64_add(a, b, carry_in=0):
-        # a * b + carry_in, return (low64, high64)
-        prod = a.astype(np.uint64) * b + carry_in
-        return prod.astype(np.uint64), (prod >> 64).astype(np.uint64)
-
-    # Process each base to generate seq_len consecutive keys with step spacing
-    out_list = []
-    s0, s1, s2, s3 = step_le_u64[0], step_le_u64[1], step_le_u64[2], step_le_u64[3]
-    
-    for base_idx in range(num_bases):
-        # How many keys to generate from this base
-        keys_from_base = min(seq_len, batch_size - len(out_list))
-        if keys_from_base <= 0:
-            break
-            
-        # Vectorized increments: base + step * [0,1,2,...,keys_from_base-1]
-        inc_factors = np.arange(keys_from_base, dtype=np.uint64)
-        
-        # step * inc_factors = [s0*inc, s1*inc, s2*inc, s3*inc] with carries
-        p0, c0 = mul64_add(s0, inc_factors)
-        p1, c1 = mul64_add(s1, inc_factors, c0)
-        p2, c2 = mul64_add(s2, inc_factors, c1)
-        p3, c3 = mul64_add(s3, inc_factors, c2)
-        
-        # Add base to each result: base + step*i
-        base_w0, base_w1, base_w2, base_w3 = base_le[base_idx, 0], base_le[base_idx, 1], base_le[base_idx, 2], base_le[base_idx, 3]
-        w0 = base_w0 + p0
-        carry = (w0 < base_w0).astype(np.uint64)
-        w1 = base_w1 + p1 + carry
-        carry = ((w1 < base_w1) | ((w1 == base_w1) & (carry == 1))).astype(np.uint64)
-        w2 = base_w2 + p2 + carry
-        carry = ((w2 < base_w2) | ((w2 == base_w2) & (carry == 1))).astype(np.uint64)
-        w3 = base_w3 + p3 + carry
-
-        # Conditional subtract n if >= n
-        ge = _lex_ge_mask_le_2d(w0, w1, w2, w3, n_le_u64)
-        if ge.any():
-            u0, u1, u2, u3 = _sub_256_le_broadcast(w0, w1, w2, w3, n_le_u64)
-            w0 = np.where(ge, u0, w0)
-            w1 = np.where(ge, u1, w1)
-            w2 = np.where(ge, u2, w2)
-            w3 = np.where(ge, u3, w3)
-
-        # Avoid zero results
-        zero_mask = (w0 == 0) & (w1 == 0) & (w2 == 0) & (w3 == 0)
-        if zero_mask.any():
-            w0 = np.where(zero_mask, np.uint64(1), w0)
-
-        # Repack to big-endian 32-byte scalars
-        vals = np.empty((keys_from_base, 4), dtype=np.uint64)
-        vals[:, 0] = w3
-        vals[:, 1] = w2
-        vals[:, 2] = w1
-        vals[:, 3] = w0
-        be = vals.byteswap()
-        out_bytes = be.tobytes()
-        batch_keys = [out_bytes[i * 32 : (i + 1) * 32] for i in range(keys_from_base)]
-        out_list.extend(batch_keys)
-
-    return out_list[:batch_size]
-
-
-def _lex_ge_mask_le(a_le, n_le):
-    # a_le: (N,4) little-endian limbs; n_le: (4,)
-    m3 = a_le[:, 3] > n_le[3]
-    e3 = a_le[:, 3] == n_le[3]
-    m2 = a_le[:, 2] > n_le[2]
-    e2 = a_le[:, 2] == n_le[2]
-    m1 = a_le[:, 1] > n_le[1]
-    e1 = a_le[:, 1] == n_le[1]
-    m0 = a_le[:, 0] >= n_le[0]
-    return m3 | (e3 & (m2 | (e2 & (m1 | (e1 & m0)))))
-
-
-def _sub_256_le_inplace(a_le, n_le, select_mask):
-    # a := a - n for rows where select_mask is True; little-endian limbs
-    sel = select_mask
-    if not sel.any():
-        return a_le
-    a0 = a_le[sel, 0]
-    a1 = a_le[sel, 1]
-    a2 = a_le[sel, 2]
-    a3 = a_le[sel, 3]
-    n0, n1, n2, n3 = (n_le[0], n_le[1], n_le[2], n_le[3])
-    r0 = a0 - n0
-    borrow = (a0 < n0).astype(a0.dtype)
-    r1 = a1 - n1 - borrow
-    borrow = ((a1 < n1) | ((a1 == n1) & (borrow == 1))).astype(a1.dtype)
-    r2 = a2 - n2 - borrow
-    borrow = ((a2 < n2) | ((a2 == n2) & (borrow == 1))).astype(a2.dtype)
-    r3 = a3 - n3 - borrow
-    a_le[sel, 0] = r0
-    a_le[sel, 1] = r1
-    a_le[sel, 2] = r2
-    a_le[sel, 3] = r3
-    return a_le
-
-
-def _lex_ge_mask_le_2d(w0, w1, w2, w3, n_le):
-    m3 = w3 > n_le[3]
-    e3 = w3 == n_le[3]
-    m2 = w2 > n_le[2]
-    e2 = w2 == n_le[2]
-    m1 = w1 > n_le[1]
-    e1 = w1 == n_le[1]
-    m0 = w0 >= n_le[0]
-    return m3 | (e3 & (m2 | (e2 & (m1 | (e1 & m0)))))
-
-
-def _sub_256_le_broadcast(w0, w1, w2, w3, n_le):
-    n0, n1, n2, n3 = (n_le[0], n_le[1], n_le[2], n_le[3])
-    r0 = w0 - n0
-    borrow = (w0 < n0).astype(w0.dtype)
-    r1 = w1 - n1 - borrow
-    borrow = ((w1 < n1) | ((w1 == n1) & (borrow == 1))).astype(w1.dtype)
-    r2 = w2 - n2 - borrow
-    borrow = ((w2 < n2) | ((w2 == n2) & (borrow == 1))).astype(w2.dtype)
-    r3 = w3 - n3 - borrow
-    return r0, r1, r2, r3
-
-
-def generate_walk_start_privkeys(batch_size: int, steps_per_thread: int) -> List[bytes]:
-    """Generate starting private keys for the walker kernel such that
-    each thread's T-step walk does not overlap with others. Starts are spaced by steps_per_thread.
-
-    This uses a lightweight Python big-int loop for correctness. Cost is negligible relative to GPU work.
-    """
-    if steps_per_thread <= 0:
-        raise ValueError("steps_per_thread must be > 0")
-    out: List[bytes] = []
-    n = SECP256K1_ORDER_INT
-    base = int.from_bytes(secrets.token_bytes(32), "big") % n
-    if base == 0:
-        base = 1
-    step = steps_per_thread % n
-    if step == 0:
-        step = 1
-    k = base
-    for _ in range(batch_size):
-        out.append(k.to_bytes(32, "big"))
-        k += step
-        if k >= n:
-            k -= n
-        if k == 0:
-            k = 1
-    return out

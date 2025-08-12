@@ -2,15 +2,15 @@ import os
 import time
 from typing import Optional
 
-from gpu_vanity import MetalVanity, generate_valid_privkeys, SECP256K1_ORDER_INT,generate_valid_privkeys
-
+from gpu_vanity import MetalVanity
+from privkey_gen import generate_valid_privkeys, SECP256K1_ORDER_INT
 
 def hex_addr(b: bytes) -> str:
     return "0x" + b.hex()
 
 
 
-def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 480*1) -> None:
+def main(batch_size: int = 1024*4, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 480*2) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
