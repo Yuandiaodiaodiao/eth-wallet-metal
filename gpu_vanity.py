@@ -337,6 +337,35 @@ KERNEL_FQ void vanity_kernel_compact(
         if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
         if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); device uchar *addr = addr_compact_out + idx * 20; for (ushort i=0;i<20;++i) addr[i] = digest[12 + i]; index_compact_out[idx] = gid; }
     }
+
+    // --- Builder for g16 table ---
+    struct G16Params { uint win; uint start; };
+
+    KERNEL_FQ void g16_builder_kernel(
+        device uchar *g16_table                  [[ buffer(0) ]],
+        device const G16Params *pp               [[ buffer(1) ]],
+        uint gid                                 [[ thread_position_in_grid ]])
+    {
+        uint idx = pp->start + gid;
+        if (idx >= 65536u) return;
+        uint win = pp->win;
+        ulong base = ((ulong)win * 65536ul + (ulong)idx) * 64ul;
+        device uchar *outp = g16_table + base;
+        if (idx == 0u){
+            for (ushort i=0;i<64;++i) outp[i]=0;
+            return;
+        }
+        // Build scalar k_local = idx << (16*win)
+        u32 k_local[8]; for (ushort i=0;i<8;++i) k_local[i]=0u;
+        uint shift = win * 16u; uint limb = shift >> 5; uint rem = shift & 31u;
+        u64 wide = ((u64)idx) << rem;
+        k_local[limb] = (u32)(wide & 0xffffffffu);
+        if (limb + 1u < 8u) k_local[limb+1u] = (u32)(wide >> 32);
+        u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &G_PRECOMP);
+        // write x,y as little-endian bytes
+        for (ushort i=0;i<8;++i){ u32 w=x[i]; ushort off=i*4; outp[off+0]=(uchar)(w & 0xFF); outp[off+1]=(uchar)((w>>8)&0xFF); outp[off+2]=(uchar)((w>>16)&0xFF); outp[off+3]=(uchar)(w>>24); }
+        for (ushort i=0;i<8;++i){ u32 w=y[i]; ushort off=32+i*4; outp[off+0]=(uchar)(w & 0xFF); outp[off+1]=(uchar)((w>>8)&0xFF); outp[off+2]=(uchar)((w>>16)&0xFF); outp[off+3]=(uchar)(w>>24); }
+    }
 '''
         )
 
@@ -367,6 +396,7 @@ KERNEL_FQ void vanity_kernel_compact(
         self.pipeline_w16_compact = None
         fn_w16 = library.newFunctionWithName_("vanity_kernel_w16")
         fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
+        fn_builder = library.newFunctionWithName_("g16_builder_kernel")
         if fn_w16 is not None and fn_w16c is not None:
             p_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16, None)
             if p_w16 is not None:
@@ -374,6 +404,11 @@ KERNEL_FQ void vanity_kernel_compact(
             p_w16c, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16c, None)
             if p_w16c is not None:
                 self.pipeline_w16_compact = p_w16c
+        self.pipeline_builder = None
+        if fn_builder is not None:
+            p_b, error = self.device.newComputePipelineStateWithFunction_error_(fn_builder, None)
+            if p_b is not None:
+                self.pipeline_builder = p_b
 
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
@@ -392,6 +427,53 @@ KERNEL_FQ void vanity_kernel_compact(
                 self.g16_buffer = buf
         except Exception:
             self.g16_buffer = None
+
+    def build_g16_table(self, repo_root: str) -> None:
+        # Build g16 table entirely on GPU; writes to memory, caller can persist to file if desired
+        if self.pipeline_builder is None:
+            raise RuntimeError("g16_builder_kernel pipeline not available")
+        total_bytes = 16 * 65536 * 64
+        if self.g16_buffer is None or int(self.g16_buffer.length()) != total_bytes:
+            self.g16_buffer = self.device.newBufferWithLength_options_(total_bytes, 0)
+        # Build per window in chunks to avoid absurd dispatch sizes
+        for win in range(16):
+            start = 0
+            while start < 65536:
+                chunk = min(65536 - start, 32768)  # at most 32k threads per dispatch
+                params = bytearray(8)
+                params[0:4] = int(win).to_bytes(4, "little")
+                params[4:8] = int(start).to_bytes(4, "little")
+                cb = self.queue.commandBuffer()
+                enc = cb.computeCommandEncoder()
+                enc.setComputePipelineState_(self.pipeline_builder)
+                enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 0)
+                try:
+                    enc.setBytes_length_atIndex_(bytes(params), 8, 1)
+                except Exception:
+                    pbuf = self.device.newBufferWithLength_options_(8, 0)
+                    pbuf.contents().as_buffer(8)[:8] = bytes(params)
+                    enc.setBuffer_offset_atIndex_(pbuf, 0, 1)
+                w = int(self.thread_execution_width)
+                try:
+                    max_threads = int(self.pipeline_builder.maxTotalThreadsPerThreadgroup())
+                except Exception:
+                    max_threads = 256
+                tpt = min(max_threads, max(w * 4, w), max(1, chunk))
+                tg = MTLSizeMake(tpt, 1, 1)
+                grid = MTLSizeMake(chunk, 1, 1)
+                enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+                enc.endEncoding()
+                cb.commit()
+                cb.waitUntilCompleted()  # sequential to limit VRAM pressure while building
+                start += chunk
+        # Optionally write to disk for future runs
+        try:
+            path = os.path.join(repo_root, "gen_eth", "secp256k1", "g16_precomp_le.bin")
+            with open(path, "wb") as f:
+                mv = self.g16_buffer.contents().as_buffer(total_bytes)
+                f.write(bytes(mv[:total_bytes]))
+        except Exception:
+            pass
    # --- Pipelined API ---
     class VanityJob:
         def __init__(self, cb, addr_buffer, flags_buffer, out_addr_size: int, out_flag_size: int, count: int):
