@@ -228,6 +228,115 @@ KERNEL_FQ void vanity_kernel_compact(
         index_compact_out[idx] = gid;
     }
 }
+
+    // --------------------------
+    // 16-bit window precomp path
+    // --------------------------
+
+    inline void load_point_from_g16(device const uchar *tbl, uint window_idx, uint idx16, thread u32 *x, thread u32 *y) {
+        if (idx16 == 0u) { for (ushort i=0;i<8;++i){ x[i]=0; y[i]=0; } return; }
+        ulong base = ((ulong)window_idx * 65536ul + (ulong)idx16) * 64ul;
+        device const uchar *p = tbl + base;
+        for (ushort i=0;i<8;++i){ ushort off=i*4; x[i] = ((u32)p[off]) | ((u32)p[off+1]<<8) | ((u32)p[off+2]<<16) | ((u32)p[off+3]<<24); }
+        for (ushort i=0;i<8;++i){ ushort off=32+i*4; y[i] = ((u32)p[off]) | ((u32)p[off+1]<<8) | ((u32)p[off+2]<<16) | ((u32)p[off+3]<<24); }
+    }
+
+    inline uint get_window16(const thread u32 *k_local, uint win){
+        uint bit = win * 16u;
+        uint limb = bit >> 5;           // /32
+        uint shift = bit & 31u;         // %32
+        uint val;
+        if (shift <= 16u) {
+            val = (k_local[limb] >> shift) & 0xFFFFu;
+        } else {
+            uint low = k_local[limb] >> shift;
+            uint high = k_local[limb+1u] << (32u - shift);
+            val = (low | high) & 0xFFFFu;
+        }
+        return val;
+    }
+
+    inline void point_mul_xy_w16(thread u32 *x_out, thread u32 *y_out, const thread u32 *k_local, device const uchar *g16_tbl){
+        bool have = false;
+        u32 x1[8]; u32 y1[8]; u32 z1[8];
+        for (ushort i=0;i<8;++i) { z1[i]=0; }
+        for (uint win = 0; win < 16u; ++win){
+            uint idx16 = get_window16(k_local, win);
+            if (idx16 == 0u) continue;
+            u32 x2[8]; u32 y2[8];
+            load_point_from_g16(g16_tbl, win, idx16, x2, y2);
+            if (!have){
+                for (ushort i=0;i<8;++i){ x1[i]=x2[i]; y1[i]=y2[i]; z1[i]=0; }
+                z1[0]=1;
+                have = true;
+            } else {
+                point_add(x1, y1, z1, x2, y2);
+            }
+        }
+        inv_mod(z1);
+        u32 z2[8]; mul_mod(z2, z1, z1);
+        mul_mod(x1, x1, z2);
+        mul_mod(z1, z2, z1);
+        mul_mod(y1, y1, z1);
+        for (ushort i=0;i<8;++i){ x_out[i]=x1[i]; y_out[i]=y1[i]; }
+    }
+
+    KERNEL_FQ void vanity_kernel_w16(
+        device const uchar *priv_in              [[ buffer(0) ]],
+        device uchar *addr_out                   [[ buffer(1) ]],
+        device uchar *flags_out                  [[ buffer(2) ]],
+        device const VanityParams *params        [[ buffer(3) ]],
+        device const uchar *g16_table            [[ buffer(4) ]],
+        uint gid                                 [[ thread_position_in_grid ]])
+    {
+        uint count = params->count;
+        if (gid >= count) return;
+        const device uchar *p = priv_in + gid * 32;
+        u32 k_be[8];
+        for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
+        u32 k_local[8];
+        k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
+        k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
+
+        u32 x[8]; u32 y[8]; point_mul_xy_w16(x, y, k_local, g16_table);
+
+        uchar pub[64];
+        for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+        for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+
+        uchar digest[32]; keccak256_64(pub, digest);
+        uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
+        uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
+        for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
+        if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
+        flags_out[gid] = ok ? (uchar)1 : (uchar)0;
+        if (ok) { device uchar *addr = addr_out + gid * 20; for (ushort i=0;i<20;++i) addr[i] = digest[12 + i]; }
+    }
+
+    KERNEL_FQ void vanity_kernel_w16_compact(
+        device const uchar *priv_in                  [[ buffer(0) ]],
+        device uchar *addr_compact_out               [[ buffer(1) ]],
+        device uint *index_compact_out               [[ buffer(2) ]],
+        device atomic_uint *out_count                [[ buffer(3) ]],
+        device const VanityParams *params            [[ buffer(4) ]],
+        device const uchar *g16_table                [[ buffer(5) ]],
+        uint gid                                     [[ thread_position_in_grid ]])
+    {
+        uint count = params->count; if (gid >= count) return;
+        const device uchar *p = priv_in + gid * 32;
+        u32 k_be[8]; for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
+        u32 k_local[8]; k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3]; k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
+        u32 x[8]; u32 y[8]; point_mul_xy_w16(x, y, k_local, g16_table);
+        uchar pub[64];
+        for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+        for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+        uchar digest[32]; keccak256_64(pub, digest);
+        uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
+        uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
+        for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
+        if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
+        if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); device uchar *addr = addr_compact_out + idx * 20; for (ushort i=0;i<20;++i) addr[i] = digest[12 + i]; index_compact_out[idx] = gid; }
+    }
 '''
         )
 
@@ -253,10 +362,36 @@ KERNEL_FQ void vanity_kernel_compact(
 
         self.pipeline = pipeline
         self.pipeline_compact = pipeline_compact
+        # Try to compile w16 kernels
+        self.pipeline_w16 = None
+        self.pipeline_w16_compact = None
+        fn_w16 = library.newFunctionWithName_("vanity_kernel_w16")
+        fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
+        if fn_w16 is not None and fn_w16c is not None:
+            p_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16, None)
+            if p_w16 is not None:
+                self.pipeline_w16 = p_w16
+            p_w16c, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16c, None)
+            if p_w16c is not None:
+                self.pipeline_w16_compact = p_w16c
+
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
         # Keep no reusable buffers here; API supports overlapping jobs, so use per-job buffers
+        # Load optional 16-bit window precomputed table from disk if available
+        self.g16_buffer = None
+        try:
+            g16_path = os.path.join(secp_dir, "g16_precomp_le.bin")
+            expected = 16 * 65536 * 64
+            if os.path.isfile(g16_path) and os.path.getsize(g16_path) == expected:
+                with open(g16_path, "rb") as f:
+                    data = f.read()
+                buf = self.device.newBufferWithLength_options_(expected, 0)
+                buf.contents().as_buffer(expected)[:expected] = data
+                self.g16_buffer = buf
+        except Exception:
+            self.g16_buffer = None
    # --- Pipelined API ---
     class VanityJob:
         def __init__(self, cb, addr_buffer, flags_buffer, out_addr_size: int, out_flag_size: int, count: int):
@@ -306,7 +441,8 @@ KERNEL_FQ void vanity_kernel_compact(
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
-        enc.setComputePipelineState_(self.pipeline)
+        use_w16 = self.g16_buffer is not None and self.pipeline_w16 is not None
+        enc.setComputePipelineState_(self.pipeline_w16 if use_w16 else self.pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(addr_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(flags_buffer, 0, 2)
@@ -317,10 +453,12 @@ KERNEL_FQ void vanity_kernel_compact(
             params_buffer = self.device.newBufferWithLength_options_(12, 0)
             params_buffer.contents().as_buffer(12)[:12] = bytes(p)
             enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
+        if use_w16:
+            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 4)
 
         w = int(self.thread_execution_width)
         try:
-            max_threads = int(self.pipeline.maxTotalThreadsPerThreadgroup())
+            max_threads = int((self.pipeline_w16 if use_w16 else self.pipeline).maxTotalThreadsPerThreadgroup())
         except Exception:
             max_threads = 256
         # Use a multiple of execution width for better occupancy, but respect device limits and problem size
@@ -420,7 +558,8 @@ KERNEL_FQ void vanity_kernel_compact(
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
-        enc.setComputePipelineState_(self.pipeline_compact)
+        use_w16 = self.g16_buffer is not None and self.pipeline_w16_compact is not None
+        enc.setComputePipelineState_(self.pipeline_w16_compact if use_w16 else self.pipeline_compact)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 2)
@@ -432,10 +571,12 @@ KERNEL_FQ void vanity_kernel_compact(
             params_buffer = self.device.newBufferWithLength_options_(12, 0)
             params_buffer.contents().as_buffer(12)[:12] = bytes(p)
             enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+        if use_w16:
+            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 5)
 
         w = int(self.thread_execution_width)
         try:
-            max_threads = int(self.pipeline_compact.maxTotalThreadsPerThreadgroup())
+            max_threads = int((self.pipeline_w16_compact if use_w16 else self.pipeline_compact).maxTotalThreadsPerThreadgroup())
         except Exception:
             max_threads = 256
         tpt = min(max_threads, max(w * 4, w), max(1, count))
