@@ -2,6 +2,7 @@ import os
 import time
 import secrets
 import threading
+import math
 from typing import List, Tuple, Optional
 
 # Precompute curve order bytes once to speed privkey validity checks
@@ -16,6 +17,17 @@ except Exception:  # Fallback if ecdsa not importable at import-time
 ZERO_32 = b"\x00" * 32
 
 from Metal import MTLCreateSystemDefaultDevice, MTLSizeMake
+
+# Integer curve order for fast modular arithmetic
+SECP256K1_ORDER_INT = int.from_bytes(SECP256K1_ORDER_BYTES, "big")
+
+# Optional NumPy acceleration (SIMD on Apple Silicon)
+try:
+    import numpy as np  # type: ignore
+
+    HAS_NUMPY = True
+except Exception:  # Optional dependency
+    HAS_NUMPY = False
 
 
 def _load_text_no_includes(path: str) -> str:
@@ -707,20 +719,150 @@ KERNEL_FQ void vanity_kernel_compact(
 
 
 def generate_valid_privkeys(batch_size: int) -> List[bytes]:
-    # Ensure 1 <= k < n, using lexicographic byte comparisons to avoid big-int conversions
+    # Fast incremental generator to remove RNG bottleneck.
+    if HAS_NUMPY:
+        return _generate_privkeys_incremental_numpy(batch_size)
+    raise NotImplementedError("NumPy is not installed")
+
+def _generate_privkeys_incremental_python(batch_size: int, seq_len: int = 8192) -> List[bytes]:
     out: List[bytes] = []
-    target = batch_size
-    n_bytes = SECP256K1_ORDER_BYTES
-    while len(out) < target:
-        # Larger chunk reduces Python overhead for very fast GPUs
-        chunk = max(8192, (target - len(out)) * 4)
-        buf = secrets.token_bytes(32 * chunk)
-        for i in range(chunk):
-            k = buf[i * 32 : (i + 1) * 32]
-            if k != ZERO_32 and k < n_bytes:
-                out.append(k)
-                if len(out) >= target:
-                    break
+    n = SECP256K1_ORDER_INT
+    num_bases = math.ceil(batch_size / seq_len)
+    for _ in range(num_bases):
+        base = int.from_bytes(secrets.token_bytes(32), "big") % n
+        if base == 0:
+            base = 1
+        # Derive a run of consecutive scalars in [1, n-1]
+        for i in range(seq_len):
+            k = base + i
+            if k >= n:
+                k -= n
+            if k == 0:
+                k = 1
+            out.append(k.to_bytes(32, "big"))
+            if len(out) >= batch_size:
+                return out
     return out
+
+
+def _generate_privkeys_incremental_numpy(batch_size: int, seq_len: int = 8192) -> List[bytes]:  # heavy vector path
+    import numpy as np  # type: ignore
+
+    # Build n as little-endian u64 limbs [w0,w1,w2,w3]
+    n_be_u64 = np.frombuffer(SECP256K1_ORDER_BYTES, dtype=">u8").reshape(4)
+    n_le_u64 = n_be_u64[::-1].byteswap().view(n_be_u64.dtype.newbyteorder())
+
+    num_bases = int(math.ceil(batch_size / seq_len))
+    # Draw random bases
+    rnd = secrets.token_bytes(32 * num_bases)
+    base_be_u64 = np.frombuffer(rnd, dtype=">u8").reshape(num_bases, 4)
+    base_le = base_be_u64[:, ::-1].byteswap().view(base_be_u64.dtype.newbyteorder())
+
+    # Reduce bases: if base >= n, subtract n
+    ge_mask = _lex_ge_mask_le(base_le, n_le_u64)
+    if ge_mask.any():
+        base_le = _sub_256_le_inplace(base_le, n_le_u64, ge_mask)
+
+    # Avoid zero
+    zero_mask = (base_le == 0).all(axis=1)
+    if zero_mask.any():
+        base_le[zero_mask, 0] = 1
+
+    # Vectorized increments over least-significant limb with carry propagation
+    inc = np.arange(seq_len, dtype=np.uint64)[None, :]
+    w0 = base_le[:, [0]] + inc
+    carry = (w0 < base_le[:, [0]]).astype(np.uint64)
+    w1 = base_le[:, [1]] + carry
+    carry = (w1 < base_le[:, [1]]).astype(np.uint64)
+    w2 = base_le[:, [2]] + carry
+    carry = (w2 < base_le[:, [2]]).astype(np.uint64)
+    w3 = base_le[:, [3]] + carry
+
+    # Conditional subtract n if >= n
+    ge = _lex_ge_mask_le_2d(w0, w1, w2, w3, n_le_u64)
+    if ge.any():
+        u0, u1, u2, u3 = _sub_256_le_broadcast(w0, w1, w2, w3, n_le_u64)
+        w0 = np.where(ge, u0, w0)
+        w1 = np.where(ge, u1, w1)
+        w2 = np.where(ge, u2, w2)
+        w3 = np.where(ge, u3, w3)
+
+    # Avoid zero results (rare when base + inc == n)
+    zero_mask_2d = (w0 == 0) & (w1 == 0) & (w2 == 0) & (w3 == 0)
+    if zero_mask_2d.any():
+        w0 = np.where(zero_mask_2d, np.uint64(1), w0)
+
+    # Repack to big-endian 32-byte scalars
+    B = num_bases
+    S = seq_len
+    vals = np.empty((B * S, 4), dtype=np.uint64)
+    vals[:, 0] = w3.reshape(-1)
+    vals[:, 1] = w2.reshape(-1)
+    vals[:, 2] = w1.reshape(-1)
+    vals[:, 3] = w0.reshape(-1)
+    be = vals.byteswap().view(vals.dtype.newbyteorder())
+    need = int(batch_size)
+    be = be[:need]
+    out_bytes = be.tobytes()
+    return [out_bytes[i * 32 : (i + 1) * 32] for i in range(need)]
+
+
+def _lex_ge_mask_le(a_le, n_le):
+    # a_le: (N,4) little-endian limbs; n_le: (4,)
+    m3 = a_le[:, 3] > n_le[3]
+    e3 = a_le[:, 3] == n_le[3]
+    m2 = a_le[:, 2] > n_le[2]
+    e2 = a_le[:, 2] == n_le[2]
+    m1 = a_le[:, 1] > n_le[1]
+    e1 = a_le[:, 1] == n_le[1]
+    m0 = a_le[:, 0] >= n_le[0]
+    return m3 | (e3 & (m2 | (e2 & (m1 | (e1 & m0)))))
+
+
+def _sub_256_le_inplace(a_le, n_le, select_mask):
+    # a := a - n for rows where select_mask is True; little-endian limbs
+    sel = select_mask
+    if not sel.any():
+        return a_le
+    a0 = a_le[sel, 0]
+    a1 = a_le[sel, 1]
+    a2 = a_le[sel, 2]
+    a3 = a_le[sel, 3]
+    n0, n1, n2, n3 = (n_le[0], n_le[1], n_le[2], n_le[3])
+    r0 = a0 - n0
+    borrow = (a0 < n0).astype(a0.dtype)
+    r1 = a1 - n1 - borrow
+    borrow = ((a1 < n1) | ((a1 == n1) & (borrow == 1))).astype(a1.dtype)
+    r2 = a2 - n2 - borrow
+    borrow = ((a2 < n2) | ((a2 == n2) & (borrow == 1))).astype(a2.dtype)
+    r3 = a3 - n3 - borrow
+    a_le[sel, 0] = r0
+    a_le[sel, 1] = r1
+    a_le[sel, 2] = r2
+    a_le[sel, 3] = r3
+    return a_le
+
+
+def _lex_ge_mask_le_2d(w0, w1, w2, w3, n_le):
+    m3 = w3 > n_le[3]
+    e3 = w3 == n_le[3]
+    m2 = w2 > n_le[2]
+    e2 = w2 == n_le[2]
+    m1 = w1 > n_le[1]
+    e1 = w1 == n_le[1]
+    m0 = w0 >= n_le[0]
+    return m3 | (e3 & (m2 | (e2 & (m1 | (e1 & m0)))))
+
+
+def _sub_256_le_broadcast(w0, w1, w2, w3, n_le):
+    n0, n1, n2, n3 = (n_le[0], n_le[1], n_le[2], n_le[3])
+    r0 = w0 - n0
+    borrow = (w0 < n0).astype(w0.dtype)
+    r1 = w1 - n1 - borrow
+    borrow = ((w1 < n1) | ((w1 == n1) & (borrow == 1))).astype(w1.dtype)
+    r2 = w2 - n2 - borrow
+    borrow = ((w2 < n2) | ((w2 == n2) & (borrow == 1))).astype(w2.dtype)
+    r3 = w3 - n3 - borrow
+    return r0, r1, r2, r3
 
 
