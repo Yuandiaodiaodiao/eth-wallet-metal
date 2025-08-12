@@ -136,100 +136,6 @@ inline void keccak256_64(const thread uchar *msg64, thread uchar *out32){
 // params buffer layout
 struct VanityParams { uint count; uint nibble; uint nibbleCount; };
 
-KERNEL_FQ void vanity_kernel(
-    device const uchar *priv_in          [[ buffer(0) ]],
-    device uchar *addr_out               [[ buffer(1) ]],
-    device uchar *flags_out              [[ buffer(2) ]],
-    device const VanityParams *params    [[ buffer(3) ]],
-    uint gid                              [[ thread_position_in_grid ]])
-{
-    uint count = params->count;
-    if (gid >= count) return;
-    const device uchar *p = priv_in + gid * 32;
-
-    // load priv big-endian -> limbs
-    u32 k_be[8];
-    for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
-    u32 k_local[8];
-    k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
-    k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
-
-    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &G_PRECOMP);
-
-    // pack pub (x||y) big-endian into thread buffer
-    uchar pub[64];
-    for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-    for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-
-    // keccak
-    uchar digest[32]; keccak256_64(pub, digest);
-    // vanity check directly on digest (address = last 20 bytes)
-    uint want = params->nibble & 0xF;
-    uint nibs = params->nibbleCount;
-    bool ok = true;
-    uchar want_byte = (uchar)((want << 4) | want);
-    uint full = nibs >> 1;            // number of full bytes to check
-    uint rem = nibs & 1u;             // 1 if one extra high nibble
-    for (uint i = 0; i < full; ++i) {
-        if (digest[12 + i] != want_byte) { ok = false; break; }
-    }
-    if (ok && rem) {
-        uchar b = digest[12 + full];
-        if ((b >> 4) != want) ok = false;
-    }
-    flags_out[gid] = ok ? (uchar)1 : (uchar)0;
-    if (ok) {
-        device uchar *addr = addr_out + gid * 20;
-        for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
-    }
-}
-
-// Compact-output variant: write matches only using atomic compaction
-KERNEL_FQ void vanity_kernel_compact(
-    device const uchar *priv_in              [[ buffer(0) ]],
-    device uint *index_compact_out           [[ buffer(1) ]],
-    device atomic_uint *out_count            [[ buffer(2) ]],
-    device const VanityParams *params        [[ buffer(3) ]],
-    uint gid                                 [[ thread_position_in_grid ]])
-{
-    uint count = params->count;
-    if (gid >= count) return;
-    const device uchar *p = priv_in + gid * 32;
-
-    // load priv big-endian -> limbs
-    u32 k_be[8];
-    for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
-    u32 k_local[8];
-    k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
-    k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
-
-    u32 x[8]; u32 y[8]; point_mul_xy(x, y, k_local, &G_PRECOMP);
-
-    // pack pub (x||y) big-endian into thread buffer
-    uchar pub[64];
-    for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-    for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-
-    // keccak
-    uchar digest[32]; keccak256_64(pub, digest);
-    // vanity check directly on digest (address = last 20 bytes)
-    uint want = params->nibble & 0xF;
-    uint nibs = params->nibbleCount;
-    bool ok = true;
-    uchar want_byte = (uchar)((want << 4) | want);
-    uint full = nibs >> 1;            // number of full bytes to check
-    uint rem = nibs & 1u;             // 1 if one extra high nibble
-    for (uint i = 0; i < full; ++i) {
-        if (digest[12 + i] != want_byte) { ok = false; break; }
-    }
-    if (ok && rem) {
-        uchar b = digest[12 + full];
-        if ((b >> 4) != want) ok = false;
-    }
-    if (ok) {
-        index_compact_out[0] = gid;
-    }
-}
 
     // --------------------------
     // 16-bit window precomp path
@@ -283,37 +189,7 @@ KERNEL_FQ void vanity_kernel_compact(
         for (ushort i=0;i<8;++i){ x_out[i]=x1[i]; y_out[i]=y1[i]; }
     }
 
-    KERNEL_FQ void vanity_kernel_w16(
-        device const uchar *priv_in              [[ buffer(0) ]],
-        device uchar *addr_out                   [[ buffer(1) ]],
-        device uchar *flags_out                  [[ buffer(2) ]],
-        device const VanityParams *params        [[ buffer(3) ]],
-        device const uchar *g16_table            [[ buffer(4) ]],
-        uint gid                                 [[ thread_position_in_grid ]])
-    {
-        uint count = params->count;
-        if (gid >= count) return;
-        const device uchar *p = priv_in + gid * 32;
-        u32 k_be[8];
-        for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
-        u32 k_local[8];
-        k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
-        k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
-
-        u32 x[8]; u32 y[8]; point_mul_xy_w16(x, y, k_local, g16_table);
-
-        uchar pub[64];
-        for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-        for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-
-        uchar digest[32]; keccak256_64(pub, digest);
-        uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
-        uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
-        for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
-        if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
-        flags_out[gid] = ok ? (uchar)1 : (uchar)0;
-        if (ok) { device uchar *addr = addr_out + gid * 20; for (ushort i=0;i<20;++i) addr[i] = digest[12 + i]; }
-    }
+    
 
     KERNEL_FQ void vanity_kernel_w16_compact(
         device const uchar *priv_in                  [[ buffer(0) ]],
@@ -381,28 +257,6 @@ KERNEL_FQ void vanity_kernel_compact(
     }
 
 
-    // Helper kernel: compute initial point from private key (original version without g16)
-    KERNEL_FQ void vanity_kernel_compute_basepoint(
-        device const uchar *priv_in                  [[ buffer(0) ]],
-        device u32 *base_points_out                  [[ buffer(1) ]],
-        device const WalkParams *params              [[ buffer(2) ]],
-        uint gid                                     [[ thread_position_in_grid ]])
-    {
-        uint count = params->count; if (gid >= count) return;
-        const device uchar *p = priv_in + gid * 32;
-        u32 k_be[8];
-        for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
-        u32 k_local[8];
-        k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
-        k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
-
-        // Base point P0 = k*G (affine)
-        u32 x0[8]; u32 y0[8]; point_mul_xy(x0, y0, k_local, &G_PRECOMP);
-        
-        // Store base point (x0, y0) to output buffer
-        device u32 *out = base_points_out + gid * 16; // 16 u32s per point (8 for x, 8 for y)
-        for (ushort i=0;i<8;++i){ out[i] = x0[i]; out[8+i] = y0[i]; }
-    }
 
     // Optimized version using g16 table for faster point multiplication
     KERNEL_FQ void vanity_kernel_compute_basepoint_w16(
@@ -547,63 +401,23 @@ KERNEL_FQ void vanity_kernel_compact(
         if library is None:
             raise RuntimeError(f"Metal library compile failed: {error}")
 
-        fn = library.newFunctionWithName_("vanity_kernel")
-        if fn is None:
-            raise RuntimeError("vanity_kernel not found")
-        fn_compact = library.newFunctionWithName_("vanity_kernel_compact")
-        if fn_compact is None:
-            raise RuntimeError("vanity_kernel_compact not found")
-
-        pipeline, error = self.device.newComputePipelineStateWithFunction_error_(fn, None)
-        if pipeline is None:
-            raise RuntimeError(f"Failed to create pipeline: {error}")
-        pipeline_compact, error = self.device.newComputePipelineStateWithFunction_error_(fn_compact, None)
-        if pipeline_compact is None:
-            raise RuntimeError(f"Failed to create compact pipeline: {error}")
-
-        self.pipeline = pipeline
-        self.pipeline_compact = pipeline_compact
+     
         # Try to compile w16 kernels
-        self.pipeline_w16 = None
         self.pipeline_w16_compact = None
-        fn_w16 = library.newFunctionWithName_("vanity_kernel_w16")
         fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
         fn_builder = library.newFunctionWithName_("g16_builder_kernel")
-        fn_compute_base = library.newFunctionWithName_("vanity_kernel_compute_basepoint")
         fn_compute_base_w16 = library.newFunctionWithName_("vanity_kernel_compute_basepoint_w16")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
-        if fn_w16 is not None and fn_w16c is not None:
-            p_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16, None)
-            if p_w16 is not None:
-                self.pipeline_w16 = p_w16
+        if fn_w16c is not None:
             p_w16c, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16c, None)
             if p_w16c is not None:
                 self.pipeline_w16_compact = p_w16c
         self.pipeline_builder = None
-        if fn_builder is not None:
-            p_b, error = self.device.newComputePipelineStateWithFunction_error_(fn_builder, None)
-            if p_b is not None:
-                self.pipeline_builder = p_b
-        self.pipeline_compute_base = None
-        self.pipeline_compute_base_w16 = None
-        if fn_compute_base is not None:
-            p_cb, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base, None)
-            if p_cb is not None:
-                self.pipeline_compute_base = p_cb
-        if fn_compute_base_w16 is not None:
-            p_cb_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base_w16, None)
-            if p_cb_w16 is not None:
-                self.pipeline_compute_base_w16 = p_cb_w16
-        # Walker pipelines
-        self.pipeline_walk_compact = None
-        if fn_walk is not None:
-            p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
-            if p_wc is not None:
-                self.pipeline_walk_compact = p_wc
+      
 
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
-        self.thread_execution_width = self.pipeline_walk_compact.threadExecutionWidth()
+        self.thread_execution_width = 16
         print(f'thread_execution_width: {self.thread_execution_width}')
         # Pipeline caches for specialized walkers
         self._walk_pipelines = {}
@@ -622,26 +436,7 @@ KERNEL_FQ void vanity_kernel_compact(
         except Exception:
             self.g16_buffer = None
 
-   # --- Pipelined API ---
-    class VanityJob:
-        def __init__(self, cb, addr_buffer, flags_buffer, out_addr_size: int, out_flag_size: int, count: int):
-            self.cb = cb
-            self.addr_buffer = addr_buffer
-            self.flags_buffer = flags_buffer
-            self.out_addr_size = out_addr_size
-            self.out_flag_size = out_flag_size
-            self.count = count
-            # Async completion signaling
-            self._done_event: threading.Event = threading.Event()
-            self._addrs: Optional[List[bytes]] = None
-            self._flags: Optional[List[int]] = None
-            self._error: Optional[Exception] = None
-            # Timing
-            self.cpu_encode_seconds: float = 0.0
-            self.gpu_start_time: float = -1.0
-            self.gpu_end_time: float = -1.0
-
-    
+   
 
     # --- Compact-output pipelined API ---
     class VanityJobCompact:
@@ -695,8 +490,8 @@ KERNEL_FQ void vanity_kernel_compact(
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
-        use_w16 = self.g16_buffer is not None and self.pipeline_w16_compact is not None
-        enc.setComputePipelineState_(self.pipeline_w16_compact if use_w16 else self.pipeline_compact)
+        use_w16 = True
+        enc.setComputePipelineState_(self.pipeline_w16_compact)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
@@ -712,7 +507,7 @@ KERNEL_FQ void vanity_kernel_compact(
 
         w = int(self.thread_execution_width)
         try:
-            max_threads = int((self.pipeline_w16_compact if use_w16 else self.pipeline_compact).maxTotalThreadsPerThreadgroup())
+            max_threads = int((self.pipeline_w16_compact).maxTotalThreadsPerThreadgroup())
         except Exception:
             max_threads = 256
         tpt = min(max_threads, max(w * 4, w), max(1, count))
@@ -765,11 +560,8 @@ KERNEL_FQ void vanity_kernel_compact(
             raise RuntimeError(f"Metal library compile failed for steps={key}: {error}")
         
         # Compile both compute_base and walk functions
-        fn_compute_base = library.newFunctionWithName_("vanity_kernel_compute_basepoint")
         fn_compute_base_w16 = library.newFunctionWithName_("vanity_kernel_compute_basepoint_w16")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
-        if fn_compute_base is None:
-            raise RuntimeError("vanity_kernel_compute_basepoint not found in specialized library")
         if fn_walk is None:
             raise RuntimeError("vanity_kernel_walk_compact not found in specialized library")
         
@@ -778,9 +570,6 @@ KERNEL_FQ void vanity_kernel_compact(
         if fn_compute_base_w16 is not None:
             p_cb_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base_w16, None)
         
-        p_cb, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base, None)
-        if p_cb is None:
-            raise RuntimeError(f"Failed to create specialized compute_base pipeline for steps={key}: {error}")
         p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
         self.thread_execution_width = p_wc.threadExecutionWidth()
         print(f'thread_execution_width: {self.thread_execution_width}')
@@ -788,8 +577,8 @@ KERNEL_FQ void vanity_kernel_compact(
             raise RuntimeError(f"Failed to create specialized walk pipeline for steps={key}: {error}")
         
         # Store both regular and w16 versions (w16 may be None)
-        self._walk_pipelines[key] = (p_cb, p_wc, p_cb_w16)
-        return (p_cb, p_wc, p_cb_w16)
+        self._walk_pipelines[key] = (None, p_wc, p_cb_w16)
+        return (None, p_wc, p_cb_w16)
 
     def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[int], int]:
         job._done_event.wait()
@@ -839,7 +628,7 @@ KERNEL_FQ void vanity_kernel_compact(
         cb = self.queue.commandBuffer()
         
         # Build or reuse specialized pipelines for this steps_per_thread
-        compute_base_pipeline, walk_pipeline, compute_base_w16_pipeline = self._ensure_walk_pipelines(steps_per_thread)
+        _, walk_pipeline, compute_base_w16_pipeline = self._ensure_walk_pipelines(steps_per_thread)
 
         # Stage 1: Compute base points from private keys
         enc1 = cb.computeCommandEncoder()
@@ -847,7 +636,7 @@ KERNEL_FQ void vanity_kernel_compact(
         use_w16_compute = compute_base_w16_pipeline is not None and self.g16_buffer is not None
         if use_w16_compute:
             print("Using optimized vanity_kernel_compute_basepoint_w16 with g16 table")
-        enc1.setComputePipelineState_(compute_base_w16_pipeline if use_w16_compute else compute_base_pipeline)
+        enc1.setComputePipelineState_(compute_base_w16_pipeline)
         enc1.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc1.setBuffer_offset_atIndex_(base_points_buffer, 0, 1)
         try:
@@ -860,7 +649,7 @@ KERNEL_FQ void vanity_kernel_compact(
         if use_w16_compute:
             enc1.setBuffer_offset_atIndex_(self.g16_buffer, 0, 3)
         
-        active_compute_pipeline = compute_base_w16_pipeline if use_w16_compute else compute_base_pipeline
+        active_compute_pipeline = compute_base_w16_pipeline
         print(f'compute_base_pipeline thread_execution_width: {active_compute_pipeline.threadExecutionWidth()}')
         max_threads = int(active_compute_pipeline.maxTotalThreadsPerThreadgroup())
         print(f'compute_base_pipeline max_threads: {max_threads}')
