@@ -1,1 +1,3 @@
 .ftp_vscode_plugin
+.venv/*
+__pycache__/*

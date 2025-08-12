@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
+def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_batches: Optional[int] = None, steps_per_thread: int = 32) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
@@ -68,11 +68,24 @@ def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_b
             # Verify address for this priv using a direct compact kernel call
             verify_job = engine.encode_and_commit_walk_compact([k_bytes], steps_per_thread=1, nibble=0x0, nibble_count=0)
             v_addrs, v_indices, _ = engine.wait_and_collect_compact(verify_job)
-            out_addr = addrs[0]
             verified_addr = v_addrs[0] if v_addrs else b""
-            print("FOUND:")
-            print("priv:", k_bytes.hex())
-            print("addr:", hex_addr(verified_addr or out_addr))
+            print(f'walk indices: {v_indices}')
+            print("walk addr:", hex_addr(verified_addr))
+            
+            print("\nTesting compact:")
+            verify_job_correct = engine.encode_and_commit_compact([k_bytes], nibble=0x0, nibble_count=0)
+            addrs, indices, _ = engine.wait_and_collect_compact(verify_job_correct)
+            
+            print(f'compact indices: {indices}')
+            print(f"compact addr:", hex_addr(addrs[0]))
+            
+            print(f"\nAddresses match: {hex_addr(verified_addr) == hex_addr(addrs[0])}")
+            
+            print(f'私钥: {k_bytes.hex()}')
+            # Check if g16 buffer is available
+            print(f"g16_buffer available: {engine.g16_buffer is not None}")
+            print(f"pipeline_w16_compact available: {engine.pipeline_w16_compact is not None}")
+            print(f"pipeline_walk_w16_compact available: {engine.pipeline_walk_w16_compact is not None}")
             return
         # Shift next -> prev for the next iteration
         privs_prev = privs_next

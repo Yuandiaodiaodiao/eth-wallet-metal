@@ -59,6 +59,11 @@ class MetalVanity:
         # Append Keccak functions (fixed-size 64-byte input) and constant precomputed secp256k1 basepoint
         src_parts.append(
             r'''
+// --- Steps specialization ---
+#ifndef T_STEPS
+#define T_STEPS 16
+#endif
+
 // Precomputed basepoint table in constant memory to be shared across all threads
 constant secp256k1_t G_PRECOMP = { {
     SECP256K1_G_PRE_COMPUTED_00, SECP256K1_G_PRE_COMPUTED_01, SECP256K1_G_PRE_COMPUTED_02, SECP256K1_G_PRE_COMPUTED_03,
@@ -414,11 +419,10 @@ KERNEL_FQ void vanity_kernel_compact(
         u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
 
         const uint steps = params->steps;
-        const ushort MAX_STEPS = 16;
-        uint T = steps; if (T > MAX_STEPS) T = MAX_STEPS; if (T == 0u) return;
+        uint T = steps; if (T > (uint)T_STEPS) T = (uint)T_STEPS;
 
-        // Storage for T Jacobian points
-        u32 xs[16][8]; u32 ys[16][8]; u32 zs[16][8];
+        // Storage for up to T_STEPS Jacobian points
+        u32 xs[T_STEPS][8]; u32 ys[T_STEPS][8]; u32 zs[T_STEPS][8];
 
         // Start in Jacobian with z=1
         u32 xj[8]; u32 yj[8]; u32 zj[8];
@@ -432,7 +436,7 @@ KERNEL_FQ void vanity_kernel_compact(
         }
 
         // Batch inversion of z's via Montgomery trick
-        u32 pref[16][8];
+        u32 pref[T_STEPS][8];
         // pref[0] = z0
         for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
         for (uint i=1;i<T; ++i){ mul_mod(pref[i], pref[i-1], zs[i]); }
@@ -502,10 +506,9 @@ KERNEL_FQ void vanity_kernel_compact(
         u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
 
         const uint steps = params->steps;
-        const ushort MAX_STEPS = 16;
-        uint T = steps; if (T > MAX_STEPS) T = MAX_STEPS; if (T == 0u) return;
+        uint T = steps; if (T > (uint)T_STEPS) T = (uint)T_STEPS;
 
-        u32 xs[16][8]; u32 ys[16][8]; u32 zs[16][8];
+        u32 xs[T_STEPS][8]; u32 ys[T_STEPS][8]; u32 zs[T_STEPS][8];
         u32 xj[8]; u32 yj[8]; u32 zj[8];
         for (ushort i=0;i<8;++i){ xj[i]=x0[i]; yj[i]=y0[i]; zj[i]=0; }
         zj[0]=1;
@@ -515,7 +518,7 @@ KERNEL_FQ void vanity_kernel_compact(
             point_add(xj, yj, zj, dx, dy);
         }
 
-        u32 pref[16][8];
+        u32 pref[T_STEPS][8];
         for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
         for (uint i=1;i<T; ++i){ mul_mod(pref[i], pref[i-1], zs[i]); }
         u32 inv_total[8]; for (ushort k=0;k<8;++k){ inv_total[k] = pref[T-1][k]; }
@@ -551,6 +554,8 @@ KERNEL_FQ void vanity_kernel_compact(
         )
 
         source = "\n".join(src_parts)
+        # Save template for per-steps specialization
+        self._source_template = source
 
         library, error = self.device.newLibraryWithSource_options_error_(source, None, None)
         if library is None:
@@ -607,6 +612,9 @@ KERNEL_FQ void vanity_kernel_compact(
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
+        # Pipeline caches for specialized walkers
+        self._walk_pipelines = {}
+        self._walk_w16_pipelines = {}
         # Keep no reusable buffers here; API supports overlapping jobs, so use per-job buffers
         # Load optional 16-bit window precomputed table from disk if available
         self.g16_buffer = None
@@ -687,91 +695,7 @@ KERNEL_FQ void vanity_kernel_compact(
             self.gpu_start_time: float = -1.0
             self.gpu_end_time: float = -1.0
 
-    def encode_and_commit(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJob":
-        if not privkeys_be32:
-            raise ValueError("privkeys_be32 must not be empty")
-        for i, k in enumerate(privkeys_be32):
-            if len(k) != 32:
-                raise ValueError(f"privkey[{i}] must be 32 bytes")
-        count = len(privkeys_be32)
-        in_size = 32 * count
-        out_addr_size = 20 * count
-        out_flag_size = count
-
-        # Per-job buffers (safe for overlapping command buffers)
-        in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
-        addr_buffer = self.device.newBufferWithLength_options_(out_addr_size, 0)
-        flags_buffer = self.device.newBufferWithLength_options_(out_flag_size, 0)
-        # Params will be set inline via setBytes to avoid allocating a buffer each call
-
-        # Fill input buffer without creating a large temporary joined bytes
-        in_mv = in_buffer.contents().as_buffer(in_size)
-        for i, k in enumerate(privkeys_be32):
-            off = i * 32
-            in_mv[off : off + 32] = k
-
-        p = bytearray(12)
-        p[0:4] = int(count).to_bytes(4, "little")
-        p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
-        p[8:12] = int(nibble_count).to_bytes(4, "little")
-        t_cpu0 = time.perf_counter()
-        cb = self.queue.commandBuffer()
-        enc = cb.computeCommandEncoder()
-        use_w16 = self.g16_buffer is not None and self.pipeline_w16 is not None
-        enc.setComputePipelineState_(self.pipeline_w16 if use_w16 else self.pipeline)
-        enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        enc.setBuffer_offset_atIndex_(addr_buffer, 0, 1)
-        enc.setBuffer_offset_atIndex_(flags_buffer, 0, 2)
-        # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
-        try:
-            enc.setBytes_length_atIndex_(bytes(p), 12, 3)
-        except Exception:
-            params_buffer = self.device.newBufferWithLength_options_(12, 0)
-            params_buffer.contents().as_buffer(12)[:12] = bytes(p)
-            enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
-        if use_w16:
-            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 4)
-
-        w = int(self.thread_execution_width)
-        try:
-            max_threads = int((self.pipeline_w16 if use_w16 else self.pipeline).maxTotalThreadsPerThreadgroup())
-        except Exception:
-            max_threads = 256
-        # Use a multiple of execution width for better occupancy, but respect device limits and problem size
-        tpt = min(max_threads, max(w * 4, w), max(1, count))
-        tg = MTLSizeMake(tpt, 1, 1)
-        # Dispatch exactly 'count' threads; avoid padded idle threads
-        grid = MTLSizeMake(count, 1, 1)
-        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
-        enc.endEncoding()
-
-        job = MetalVanity.VanityJob(cb, addr_buffer, flags_buffer, out_addr_size, out_flag_size, count)
-
-        # Attach completion handler so results are captured without explicit wait on GPU
-        def _on_completed(inner_cb):
-            try:
-                addr_bytes = bytes(job.addr_buffer.contents().as_buffer(job.out_addr_size)[:job.out_addr_size])
-                flags_bytes = bytes(job.flags_buffer.contents().as_buffer(job.out_flag_size)[:job.out_flag_size])
-                job._addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(job.count)]
-                job._flags = [flags_bytes[i] for i in range(job.count)]
-                # GPU timing if supported
-                try:
-                    job.gpu_start_time = float(inner_cb.GPUStartTime())  # type: ignore[attr-defined]
-                    job.gpu_end_time = float(inner_cb.GPUEndTime())      # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            except Exception as e:
-                job._error = e
-            finally:
-                job._done_event.set()
-
-        cb.addCompletedHandler_(_on_completed)
-        # Submit
-        cb.commit()
-        job.cpu_encode_seconds = time.perf_counter() - t_cpu0
-
-        return job
-
+    
     def wait_and_collect(self, job: "MetalVanity.VanityJob") -> Tuple[List[bytes], List[int]]:
         # Wait for asynchronous completion handler to finish copying results
         job._done_event.wait()
@@ -896,6 +820,30 @@ KERNEL_FQ void vanity_kernel_compact(
         job.cpu_encode_seconds = time.perf_counter() - t_cpu0
         return job
 
+    def _ensure_walk_pipelines(self, steps_per_thread: int):
+        key = int(steps_per_thread)
+        # Return cached pipelines if present
+        if key in self._walk_pipelines:
+            return self._walk_pipelines[key], self._walk_w16_pipelines.get(key)
+        # Compile specialized library with T_STEPS macro
+        specialized = f"#define T_STEPS {key}\n" + self._source_template
+        library, error = self.device.newLibraryWithSource_options_error_(specialized, None, None)
+        if library is None:
+            raise RuntimeError(f"Metal library compile failed for steps={key}: {error}")
+        fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
+        if fn_walk is None:
+            raise RuntimeError("vanity_kernel_walk_compact not found in specialized library")
+        p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
+        if p_wc is None:
+            raise RuntimeError(f"Failed to create specialized walk pipeline for steps={key}: {error}")
+        fn_walk_w16 = library.newFunctionWithName_("vanity_kernel_walk_w16_compact")
+        p_wwc = None
+        if fn_walk_w16 is not None:
+            p_wwc, _ = self.device.newComputePipelineStateWithFunction_error_(fn_walk_w16, None)
+        self._walk_pipelines[key] = p_wc
+        self._walk_w16_pipelines[key] = p_wwc
+        return p_wc, p_wwc
+
     def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int], int]:
         job._done_event.wait()
         if job._error is not None:
@@ -908,8 +856,6 @@ KERNEL_FQ void vanity_kernel_compact(
             raise ValueError("privkeys_be32 must not be empty")
         if steps_per_thread <= 0:
             raise ValueError("steps_per_thread must be > 0")
-        if steps_per_thread > 16:
-            steps_per_thread = 16
         for i, k in enumerate(privkeys_be32):
             if len(k) != 32:
                 raise ValueError(f"privkey[{i}] must be 32 bytes")
@@ -919,8 +865,11 @@ KERNEL_FQ void vanity_kernel_compact(
 
         # Buffers
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
+        # evm地址buff
         addr_compact_buffer = self.device.newBufferWithLength_options_(20 * capacity_count, 0)
+        # 索引buff
         index_compact_buffer = self.device.newBufferWithLength_options_(4 * capacity_count, 0)
+        # 输出计数buff
         out_count_buffer = self.device.newBufferWithLength_options_(4, 0)
 
         # Fill inputs
@@ -942,11 +891,11 @@ KERNEL_FQ void vanity_kernel_compact(
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
-        use_w16 = (self.g16_buffer is not None) and (self.pipeline_walk_w16_compact is not None)
-        pipeline = self.pipeline_walk_w16_compact if use_w16 else self.pipeline_walk_compact
-        if pipeline is None:
-            # Fallback to one-shot compact kernel if walker is unavailable
-            return self.encode_and_commit_compact(privkeys_be32, nibble=nibble, nibble_count=nibble_count)
+        use_w16 = False
+        # Build or reuse a specialized pipeline for this steps_per_thread
+        pipeline, pipeline_w16 = self._ensure_walk_pipelines(steps_per_thread)
+        if use_w16 and pipeline_w16 is not None and self.g16_buffer is not None:
+            pipeline = pipeline_w16
         enc.setComputePipelineState_(pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
