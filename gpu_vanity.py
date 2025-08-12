@@ -49,7 +49,7 @@ class MetalVanity:
 #endif
 
 // Fixed window size for sliding batch processing to avoid stack overflow
-#define BATCH_WINDOW_SIZE 480
+#define BATCH_WINDOW_SIZE 256
 
 // Precomputed basepoint table in constant memory to be shared across all threads
 constant secp256k1_t G_PRECOMP = { {
@@ -187,10 +187,9 @@ KERNEL_FQ void vanity_kernel(
 // Compact-output variant: write matches only using atomic compaction
 KERNEL_FQ void vanity_kernel_compact(
     device const uchar *priv_in              [[ buffer(0) ]],
-    device uchar *addr_compact_out           [[ buffer(1) ]],
-    device uint *index_compact_out           [[ buffer(2) ]],
-    device atomic_uint *out_count            [[ buffer(3) ]],
-    device const VanityParams *params        [[ buffer(4) ]],
+    device uint *index_compact_out           [[ buffer(1) ]],
+    device atomic_uint *out_count            [[ buffer(2) ]],
+    device const VanityParams *params        [[ buffer(3) ]],
     uint gid                                 [[ thread_position_in_grid ]])
 {
     uint count = params->count;
@@ -229,8 +228,6 @@ KERNEL_FQ void vanity_kernel_compact(
     }
     if (ok) {
         uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-        device uchar *addr = addr_compact_out + idx * 20;
-        for (ushort i=0;i<20;++i) addr[i] = digest[12 + i];
         index_compact_out[idx] = gid;
     }
 }
@@ -321,11 +318,10 @@ KERNEL_FQ void vanity_kernel_compact(
 
     KERNEL_FQ void vanity_kernel_w16_compact(
         device const uchar *priv_in                  [[ buffer(0) ]],
-        device uchar *addr_compact_out               [[ buffer(1) ]],
-        device uint *index_compact_out               [[ buffer(2) ]],
-        device atomic_uint *out_count                [[ buffer(3) ]],
-        device const VanityParams *params            [[ buffer(4) ]],
-        device const uchar *g16_table                [[ buffer(5) ]],
+        device uint *index_compact_out               [[ buffer(1) ]],
+        device atomic_uint *out_count                [[ buffer(2) ]],
+        device const VanityParams *params            [[ buffer(3) ]],
+        device const uchar *g16_table                [[ buffer(4) ]],
         uint gid                                     [[ thread_position_in_grid ]])
     {
         uint count = params->count; if (gid >= count) return;
@@ -341,7 +337,7 @@ KERNEL_FQ void vanity_kernel_compact(
         uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
         for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
         if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
-        if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); device uchar *addr = addr_compact_out + idx * 20; for (ushort i=0;i<20;++i) addr[i] = digest[12 + i]; index_compact_out[idx] = gid; }
+        if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); index_compact_out[idx] = gid; }
     }
 
     // --- Builder for g16 table ---
@@ -389,10 +385,9 @@ KERNEL_FQ void vanity_kernel_compact(
     // Non-w16 walker (fallback): uses point_mul_xy with precomputed G
     KERNEL_FQ void vanity_kernel_walk_compact(
         device const uchar *priv_in                  [[ buffer(0) ]],
-        device uchar *addr_compact_out               [[ buffer(1) ]],
-        device uint *index_compact_out               [[ buffer(2) ]],
-        device atomic_uint *out_count                [[ buffer(3) ]],
-        device const WalkParams *params              [[ buffer(4) ]],
+        device uint *index_compact_out               [[ buffer(1) ]],
+        device atomic_uint *out_count                [[ buffer(2) ]],
+        device const WalkParams *params              [[ buffer(3) ]],
         uint gid                                     [[ thread_position_in_grid ]])
     {
         uint count = params->count; if (gid >= count) return;
@@ -489,8 +484,6 @@ KERNEL_FQ void vanity_kernel_compact(
                     
                     if (ok){
                         uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                        // device uchar *addr = addr_compact_out + idx * 20;
-                        // for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
                         index_compact_out[idx] = gid * steps + processed + (uint)ii;
                     }
                 }
@@ -555,7 +548,8 @@ KERNEL_FQ void vanity_kernel_compact(
 
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
-        self.thread_execution_width = self.pipeline.threadExecutionWidth()
+        self.thread_execution_width = self.pipeline_walk_compact.threadExecutionWidth()
+        print(f'thread_execution_width: {self.thread_execution_width}')
         # Pipeline caches for specialized walkers
         self._walk_pipelines = {}
         # Keep no reusable buffers here; API supports overlapping jobs, so use per-job buffers
@@ -596,20 +590,19 @@ KERNEL_FQ void vanity_kernel_compact(
 
     # --- Compact-output pipelined API ---
     class VanityJobCompact:
-        def __init__(self, cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, capacity_count: int):
+        def __init__(self, cb, index_compact_buffer, out_count_buffer, capacity_count: int):
             self.cb = cb
-            self.addr_compact_buffer = addr_compact_buffer
             self.index_compact_buffer = index_compact_buffer
             self.out_count_buffer = out_count_buffer
             self.capacity_count = capacity_count
             # Encoded steps per thread used by the kernel that produced indices
             self.effective_steps_per_thread: int = 1
             self._done_event: threading.Event = threading.Event()
-            self._addrs: Optional[List[bytes]] = None
             self._indices: Optional[List[int]] = None
             self._error: Optional[Exception] = None
             # Timing
             self.cpu_encode_seconds: float = 0.0
+            self.cpu_completion_seconds: float = 0.0
             self.gpu_start_time: float = -1.0
             self.gpu_end_time: float = -1.0
 
@@ -621,13 +614,10 @@ KERNEL_FQ void vanity_kernel_compact(
                 raise ValueError(f"privkey[{i}] must be 32 bytes")
         count = len(privkeys_be32)
         in_size = 32 * count
-        # Worst-case we allocate full capacity; actual matches are typically few
-        addr_cap_bytes = 20 * count
         idx_cap_bytes = 4 * count
 
         # Per-job buffers; overlapping jobs are expected
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
-        addr_compact_buffer = self.device.newBufferWithLength_options_(addr_cap_bytes, 0)
         index_compact_buffer = self.device.newBufferWithLength_options_(idx_cap_bytes, 0)
         out_count_buffer = self.device.newBufferWithLength_options_(4, 0)
         # Params will be set inline via setBytes to avoid allocating a buffer each call
@@ -653,18 +643,17 @@ KERNEL_FQ void vanity_kernel_compact(
         use_w16 = self.g16_buffer is not None and self.pipeline_w16_compact is not None
         enc.setComputePipelineState_(self.pipeline_w16_compact if use_w16 else self.pipeline_compact)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
-        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 2)
-        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 3)
+        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
+        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
         try:
-            enc.setBytes_length_atIndex_(bytes(p), 12, 4)
+            enc.setBytes_length_atIndex_(bytes(p), 12, 3)
         except Exception:
             params_buffer = self.device.newBufferWithLength_options_(12, 0)
             params_buffer.contents().as_buffer(12)[:12] = bytes(p)
-            enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+            enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
         if use_w16:
-            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 5)
+            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 4)
 
         w = int(self.thread_execution_width)
         try:
@@ -678,21 +667,19 @@ KERNEL_FQ void vanity_kernel_compact(
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
         enc.endEncoding()
 
-        job = MetalVanity.VanityJobCompact(cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, count)
+        job = MetalVanity.VanityJobCompact(cb, index_compact_buffer, out_count_buffer, count)
         job.effective_steps_per_thread = 1
 
         def _on_completed(inner_cb):
+            cpu_start = time.perf_counter()
             try:
                 # Read number of matches
                 c_bytes = bytes(job.out_count_buffer.contents().as_buffer(4)[:4])
                 out_count = int.from_bytes(c_bytes, "little")
                 out_count = max(0, min(out_count, job.capacity_count))
-                # Read compact addresses and indices
-                addr_bytes = bytes(job.addr_compact_buffer.contents().as_buffer(20 * job.capacity_count)[: 20 * out_count])
-                idx_bytes = bytes(job.index_compact_buffer.contents().as_buffer(4 * job.capacity_count)[: 4 * out_count])
-                addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(out_count)]
-                indices = [int.from_bytes(idx_bytes[i * 4 : (i + 1) * 4], "little") for i in range(out_count)]
-                job._addrs = addrs
+                # Read compact indices
+                idx_bytes = bytes(job.index_compact_buffer.contents().as_buffer(4)[:4])
+                indices = [int.from_bytes(idx_bytes, "little")] if out_count > 0 else []
                 job._indices = indices
                 # GPU timing if supported
                 try:
@@ -703,6 +690,7 @@ KERNEL_FQ void vanity_kernel_compact(
             except Exception as e:
                 job._error = e
             finally:
+                job.cpu_completion_seconds = time.perf_counter() - cpu_start
                 job._done_event.set()
 
         cb.addCompletedHandler_(_on_completed)
@@ -724,16 +712,18 @@ KERNEL_FQ void vanity_kernel_compact(
         if fn_walk is None:
             raise RuntimeError("vanity_kernel_walk_compact not found in specialized library")
         p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
+        self.thread_execution_width = p_wc.threadExecutionWidth()
+        print(f'thread_execution_width: {self.thread_execution_width}')
         if p_wc is None:
             raise RuntimeError(f"Failed to create specialized walk pipeline for steps={key}: {error}")
         self._walk_pipelines[key] = p_wc
         return p_wc
 
-    def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int], int]:
+    def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[int], int]:
         job._done_event.wait()
         if job._error is not None:
             raise job._error
-        return job._addrs or [], job._indices or [], job.effective_steps_per_thread
+        return job._indices or [], job.effective_steps_per_thread
 
 
     def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
@@ -750,10 +740,8 @@ KERNEL_FQ void vanity_kernel_compact(
 
         # Buffers
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
-        # evm地址buff
-        addr_compact_buffer = self.device.newBufferWithLength_options_(20 * capacity_count, 0)
         # 索引buff
-        index_compact_buffer = self.device.newBufferWithLength_options_(4 * capacity_count, 0)
+        index_compact_buffer = self.device.newBufferWithLength_options_(4, 0)
         # 输出计数buff
         out_count_buffer = self.device.newBufferWithLength_options_(4, 0)
 
@@ -780,40 +768,39 @@ KERNEL_FQ void vanity_kernel_compact(
         pipeline = self._ensure_walk_pipelines(steps_per_thread)
         enc.setComputePipelineState_(pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
-        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 2)
-        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 3)
+        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
+        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         try:
-            enc.setBytes_length_atIndex_(bytes(p), 16, 4)
+            enc.setBytes_length_atIndex_(bytes(p), 16, 3)
         except Exception:
             params_buffer = self.device.newBufferWithLength_options_(16, 0)
             params_buffer.contents().as_buffer(16)[:16] = bytes(p)
-            enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+            enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
 
         w = int(self.thread_execution_width)
         try:
             max_threads = int(pipeline.maxTotalThreadsPerThreadgroup())
+            print(f'max_threads: {max_threads}')
         except Exception:
             max_threads = 256
-        tpt = min(max_threads, max(w * 4, w), max(1, count))
+        tpt = 64
+        print(f'tpt: {tpt}')
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(count, 1, 1)
         enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
         enc.endEncoding()
 
-        job = MetalVanity.VanityJobCompact(cb, addr_compact_buffer, index_compact_buffer, out_count_buffer, capacity_count)
+        job = MetalVanity.VanityJobCompact(cb, index_compact_buffer, out_count_buffer, capacity_count)
         job.effective_steps_per_thread = int(steps_per_thread)
 
         def _on_completed(inner_cb):
+            cpu_start = time.perf_counter()
             try:
                 c_bytes = bytes(job.out_count_buffer.contents().as_buffer(4)[:4])
                 out_count = int.from_bytes(c_bytes, "little")
                 out_count = max(0, min(out_count, job.capacity_count))
-                addr_bytes = bytes(job.addr_compact_buffer.contents().as_buffer(20 * job.capacity_count)[: 20 * out_count])
-                idx_bytes = bytes(job.index_compact_buffer.contents().as_buffer(4 * job.capacity_count)[: 4 * out_count])
-                addrs = [addr_bytes[i * 20 : (i + 1) * 20] for i in range(out_count)]
-                indices = [int.from_bytes(idx_bytes[i * 4 : (i + 1) * 4], "little") for i in range(out_count)]
-                job._addrs = addrs
+                idx_bytes = bytes(job.index_compact_buffer.contents().as_buffer(4)[:4])
+                indices = [int.from_bytes(idx_bytes, "little")] if out_count > 0 else []
                 job._indices = indices
                 try:
                     job.gpu_start_time = float(inner_cb.GPUStartTime())
@@ -823,6 +810,7 @@ KERNEL_FQ void vanity_kernel_compact(
             except Exception as e:
                 job._error = e
             finally:
+                job.cpu_completion_seconds = time.perf_counter() - cpu_start
                 job._done_event.set()
 
         cb.addCompletedHandler_(_on_completed)

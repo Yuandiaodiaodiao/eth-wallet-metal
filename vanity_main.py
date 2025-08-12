@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 1024*4, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 480*2) -> None:
+def main(batch_size: int = 384*8, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 256*16) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
@@ -32,7 +32,7 @@ def main(batch_size: int = 1024*4, nibble: int = 0x8, nibble_count: int = 8, max
         job_next = engine.encode_and_commit_walk_compact(privs_next, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
 
         # Now wait and collect the previous job while the next one is queued/running
-        addrs, indices, steps_effective = engine.wait_and_collect_compact(job_prev)
+        indices, steps_effective = engine.wait_and_collect_compact(job_prev)
         total_keys += batch_size * steps_per_thread
         avg_elapsed = max(time.perf_counter() - start_time, 1e-9)
         avg_rate = total_keys / avg_elapsed
@@ -67,19 +67,15 @@ def main(batch_size: int = 1024*4, nibble: int = 0x8, nibble_count: int = 8, max
             k_bytes = k.to_bytes(32, "big")
             # Verify address for this priv using a direct compact kernel call
             verify_job = engine.encode_and_commit_walk_compact([k_bytes], steps_per_thread=1, nibble=0x0, nibble_count=0)
-            v_addrs, v_indices, _ = engine.wait_and_collect_compact(verify_job)
-            verified_addr = v_addrs[0] if v_addrs else b""
+            v_indices, _ = engine.wait_and_collect_compact(verify_job)
             print(f'walk indices: {v_indices}')
-            print("walk addr:", hex_addr(verified_addr))
             
             print("\nTesting compact:")
             verify_job_correct = engine.encode_and_commit_compact([k_bytes], nibble=0x0, nibble_count=0)
-            addrs, indices, _ = engine.wait_and_collect_compact(verify_job_correct)
+            indices, _ = engine.wait_and_collect_compact(verify_job_correct)
             
             print(f'compact indices: {indices}')
-            print(f"compact addr:", hex_addr(addrs[0]))
             
-            print(f"\nAddresses match: {hex_addr(verified_addr) == hex_addr(addrs[0])}")
             
             print(f'私钥: {k_bytes.hex()}')
             # Check if g16 buffer is available
