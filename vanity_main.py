@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 3, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
+def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
@@ -52,6 +52,7 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 3, m
         )
 
         if indices:
+            print(f"indices: {indices}")
             idx = indices[0]
             # Use the steps used by the GPU job that produced this result
             gid = idx // max(1, steps_effective)
@@ -65,7 +66,7 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 3, m
                 k = 1
             k_bytes = k.to_bytes(32, "big")
             # Verify address for this priv using a direct compact kernel call
-            verify_job = engine.encode_and_commit_compact([k_bytes], nibble=0x0, nibble_count=0)
+            verify_job = engine.encode_and_commit_walk_compact([k_bytes], steps_per_thread=1, nibble=0x0, nibble_count=0)
             v_addrs, v_indices, _ = engine.wait_and_collect_compact(verify_job)
             out_addr = addrs[0]
             verified_addr = v_addrs[0] if v_addrs else b""
