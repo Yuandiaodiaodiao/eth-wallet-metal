@@ -10,45 +10,53 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 384*8, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 256*16) -> None:
+def main(batch_size: int = 384*8, nibble: int = 0x8, nibble_count: int = 7, max_batches: Optional[int] = None, steps_per_thread: int = 256*16) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
-    # Double-buffering with compact GPU output to minimize readback
-    t_gen0 = time.perf_counter()
-    privs_prev = generate_valid_privkeys(batch_size)
-    gen_prev_sec = time.perf_counter() - t_gen0
-    job_prev = engine.encode_and_commit_walk_compact(privs_prev, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
+    # Triple-buffering with compact GPU output to maximize GPU utilization
     start_time = time.perf_counter()
     total_keys = 0
+    
+    # Initialize first three buffers
+    t_gen0 = time.perf_counter()
+    privs_0 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
+    gen_0_sec = time.perf_counter() - t_gen0
+    job_0 = engine.encode_and_commit_walk_compact(privs_0, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
+    
+    t_gen1 = time.perf_counter()
+    privs_1 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
+    gen_1_sec = time.perf_counter() - t_gen1
+    job_1 = engine.encode_and_commit_walk_compact(privs_1, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
+    
+    # Circular buffer indices
+    current_buffer = 0
+    privs = [privs_0, privs_1]
+    jobs = [job_0, job_1]
+    gen_times = [gen_0_sec, gen_1_sec]
 
     while True:
         batches += 1
-        # print(f'batch {batches}')
-        # Prepare and immediately commit the next batch so a command is always in-flight
-        t_gen = time.perf_counter()
-        privs_next = generate_valid_privkeys(batch_size ,steps_per_thread,128)
-        gen_next_sec = time.perf_counter() - t_gen
-        job_next = engine.encode_and_commit_walk_compact(privs_next, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
-
-        # Now wait and collect the previous job while the next one is queued/running
-        indices, steps_effective = engine.wait_and_collect_compact(job_prev)
+        # Wait for the oldest job to complete
+        oldest_idx = current_buffer
+        indices, steps_effective = engine.wait_and_collect_compact(jobs[oldest_idx])
+        print(f'batch: {batches}')
         total_keys += batch_size * steps_per_thread
         avg_elapsed = max(time.perf_counter() - start_time, 1e-9)
         avg_rate = total_keys / avg_elapsed
+        
         # Timing diagnostics
-        cpu_encode = job_prev.cpu_encode_seconds
+        cpu_encode = jobs[oldest_idx].cpu_encode_seconds
         gpu_ms = -1.0
-        if getattr(job_prev, 'gpu_start_time', -1.0) and getattr(job_prev, 'gpu_end_time', -1.0):
+        if getattr(jobs[oldest_idx], 'gpu_start_time', -1.0) and getattr(jobs[oldest_idx], 'gpu_end_time', -1.0):
             try:
-                gpu_ms = max(0.0, (job_prev.gpu_end_time - job_prev.gpu_start_time) * 1e3)
+                gpu_ms = max(0.0, (jobs[oldest_idx].gpu_end_time - jobs[oldest_idx].gpu_start_time) * 1e3)
             except Exception:
                 gpu_ms = -1.0
-        # Which generation time to attribute to the batch we just completed?
-        # gen_prev_sec corresponds to prev batch's key generation
+                
         print(
             f"avg rate: {avg_rate:,.2f} keys/s ({avg_rate/1e6:.3f} MH/s) | "
-            f"CPU gen: {gen_prev_sec*1e3:.2f} ms, CPU encode: {cpu_encode*1e3:.2f} ms, GPU: {gpu_ms:.2f} ms"
+            f"CPU gen: {gen_times[oldest_idx]*1e3:.2f} ms, CPU encode: {cpu_encode*1e3:.2f} ms, GPU: {gpu_ms:.2f} ms"
         )
 
         if indices:
@@ -57,7 +65,7 @@ def main(batch_size: int = 384*8, nibble: int = 0x8, nibble_count: int = 8, max_
             # Use the steps used by the GPU job that produced this result
             gid = idx // max(1, steps_effective)
             off = idx % max(1, steps_effective)
-            base = int.from_bytes(privs_prev[gid], "big")
+            base = int.from_bytes(privs[oldest_idx][gid], "big")
             k = base + off
             n = SECP256K1_ORDER_INT
             if k >= n:
@@ -81,12 +89,18 @@ def main(batch_size: int = 384*8, nibble: int = 0x8, nibble_count: int = 8, max_
             # Check if g16 buffer is available
             print(f"g16_buffer available: {engine.g16_buffer is not None}")
             print(f"pipeline_w16_compact available: {engine.pipeline_w16_compact is not None}")
-            print(f"pipeline_walk_w16_compact available: {engine.pipeline_walk_w16_compact is not None}")
+            # print(f"pipeline_walk_w16_compact available: {engine.pipeline_walk_w16_compact is not None}")
             return
-        # Shift next -> prev for the next iteration
-        privs_prev = privs_next
-        job_prev = job_next
-        gen_prev_sec = gen_next_sec
+            
+        # Generate new keys and submit new job to replace the completed one
+        t_gen = time.perf_counter()
+        privs[oldest_idx] = generate_valid_privkeys(batch_size, steps_per_thread, 128)
+        gen_times[oldest_idx] = time.perf_counter() - t_gen
+        jobs[oldest_idx] = engine.encode_and_commit_walk_compact(privs[oldest_idx], steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
+        
+        # Move to next buffer in circular fashion
+        current_buffer = (current_buffer + 1) % len(jobs)
+        
         if max_batches is not None and batches >= max_batches:
             print("No match in", batches, "batches")
             return

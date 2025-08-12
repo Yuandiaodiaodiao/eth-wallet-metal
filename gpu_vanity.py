@@ -227,8 +227,7 @@ KERNEL_FQ void vanity_kernel_compact(
         if ((b >> 4) != want) ok = false;
     }
     if (ok) {
-        uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-        index_compact_out[idx] = gid;
+        index_compact_out[0] = gid;
     }
 }
 
@@ -337,7 +336,7 @@ KERNEL_FQ void vanity_kernel_compact(
         uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
         for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
         if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
-        if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); index_compact_out[idx] = gid; }
+        if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); index_compact_out[0] = gid; }
     }
 
     // --- Builder for g16 table ---
@@ -382,12 +381,11 @@ KERNEL_FQ void vanity_kernel_compact(
     }
 
 
-    // Non-w16 walker (fallback): uses point_mul_xy with precomputed G
-    KERNEL_FQ void vanity_kernel_walk_compact(
+    // Helper kernel: compute initial point from private key
+    KERNEL_FQ void vanity_kernel_compute_basepoint(
         device const uchar *priv_in                  [[ buffer(0) ]],
-        device uint *index_compact_out               [[ buffer(1) ]],
-        device atomic_uint *out_count                [[ buffer(2) ]],
-        device const WalkParams *params              [[ buffer(3) ]],
+        device u32 *base_points_out                  [[ buffer(1) ]],
+        device const WalkParams *params              [[ buffer(2) ]],
         uint gid                                     [[ thread_position_in_grid ]])
     {
         uint count = params->count; if (gid >= count) return;
@@ -400,6 +398,27 @@ KERNEL_FQ void vanity_kernel_compact(
 
         // Base point P0 = k*G (affine)
         u32 x0[8]; u32 y0[8]; point_mul_xy(x0, y0, k_local, &G_PRECOMP);
+        
+        // Store base point (x0, y0) to output buffer
+        device u32 *out = base_points_out + gid * 16; // 16 u32s per point (8 for x, 8 for y)
+        for (ushort i=0;i<8;++i){ out[i] = x0[i]; out[8+i] = y0[i]; }
+    }
+
+    // Optimized walker: uses precomputed base points to reduce register usage
+    KERNEL_FQ void vanity_kernel_walk_compact(
+        device const u32 *base_points_in             [[ buffer(0) ]],
+        device uint *index_compact_out               [[ buffer(1) ]],
+        device atomic_uint *out_count                [[ buffer(2) ]],
+        device const WalkParams *params              [[ buffer(3) ]],
+        uint gid                                     [[ thread_position_in_grid ]])
+    {
+        uint count = params->count; if (gid >= count) return;
+        
+        // Load precomputed base point (x0, y0)
+        device const u32 *base_point = base_points_in + gid * 16;
+        u32 x0[8]; u32 y0[8];
+        for (ushort i=0;i<8;++i){ x0[i] = base_point[i]; y0[i] = base_point[8+i]; }
+        
         // Prepare delta = G (affine)
         u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
 
@@ -407,10 +426,10 @@ KERNEL_FQ void vanity_kernel_compact(
         uint want = params->nibble & 0xF; 
         uint nibs = params->nibbleCount;
 
-        // Convert to Jacobian for batch processing
-        u32 base_x[8], base_y[8], base_z[8];
-        for (ushort i=0;i<8;++i){ base_x[i]=x0[i]; base_y[i]=y0[i]; base_z[i]=0; }
-        base_z[0]=1;
+        // Convert to Jacobian for batch processing - use x0/y0 directly  
+        u32 z0[8];
+        for (ushort i=0;i<8;++i){ z0[i]=0; }
+        z0[0]=1;
  // Stack arrays for this batch - fixed size to avoid overflow
         u32 xs[BATCH_WINDOW_SIZE][8];
         u32 ys[BATCH_WINDOW_SIZE][8]; 
@@ -428,8 +447,8 @@ KERNEL_FQ void vanity_kernel_compact(
                 
                 // Generate batch_size points by repeated addition
                 for (uint i=0; i<BATCH_WINDOW_SIZE; ++i){
-                    for (ushort k=0;k<8;++k){ xs[i][k]=base_x[k]; ys[i][k]=base_y[k]; zs[i][k]=base_z[k]; }
-                    point_add(base_x, base_y, base_z, dx, dy);
+                    for (ushort k=0;k<8;++k){ xs[i][k]=x0[k]; ys[i][k]=y0[k]; zs[i][k]=z0[k]; }
+                    point_add(x0, y0, z0, dx, dy);
                 }
                 
                 
@@ -484,7 +503,7 @@ KERNEL_FQ void vanity_kernel_compact(
                     
                     if (ok){
                         uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                        index_compact_out[idx] = gid * steps + processed + (uint)ii;
+                        index_compact_out[0] = gid * steps + processed + (uint)ii;
                     }
                 }
             }
@@ -526,6 +545,7 @@ KERNEL_FQ void vanity_kernel_compact(
         fn_w16 = library.newFunctionWithName_("vanity_kernel_w16")
         fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
         fn_builder = library.newFunctionWithName_("g16_builder_kernel")
+        fn_compute_base = library.newFunctionWithName_("vanity_kernel_compute_basepoint")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
         if fn_w16 is not None and fn_w16c is not None:
             p_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16, None)
@@ -539,6 +559,11 @@ KERNEL_FQ void vanity_kernel_compact(
             p_b, error = self.device.newComputePipelineStateWithFunction_error_(fn_builder, None)
             if p_b is not None:
                 self.pipeline_builder = p_b
+        self.pipeline_compute_base = None
+        if fn_compute_base is not None:
+            p_cb, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base, None)
+            if p_cb is not None:
+                self.pipeline_compute_base = p_cb
         # Walker pipelines
         self.pipeline_walk_compact = None
         if fn_walk is not None:
@@ -708,16 +733,26 @@ KERNEL_FQ void vanity_kernel_compact(
         library, error = self.device.newLibraryWithSource_options_error_(specialized, None, None)
         if library is None:
             raise RuntimeError(f"Metal library compile failed for steps={key}: {error}")
+        
+        # Compile both compute_base and walk functions
+        fn_compute_base = library.newFunctionWithName_("vanity_kernel_compute_basepoint")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
+        if fn_compute_base is None:
+            raise RuntimeError("vanity_kernel_compute_basepoint not found in specialized library")
         if fn_walk is None:
             raise RuntimeError("vanity_kernel_walk_compact not found in specialized library")
+        
+        p_cb, error = self.device.newComputePipelineStateWithFunction_error_(fn_compute_base, None)
+        if p_cb is None:
+            raise RuntimeError(f"Failed to create specialized compute_base pipeline for steps={key}: {error}")
         p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
         self.thread_execution_width = p_wc.threadExecutionWidth()
         print(f'thread_execution_width: {self.thread_execution_width}')
         if p_wc is None:
             raise RuntimeError(f"Failed to create specialized walk pipeline for steps={key}: {error}")
-        self._walk_pipelines[key] = p_wc
-        return p_wc
+        
+        self._walk_pipelines[key] = (p_cb, p_wc)
+        return (p_cb, p_wc)
 
     def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[int], int]:
         job._done_event.wait()
@@ -740,6 +775,8 @@ KERNEL_FQ void vanity_kernel_compact(
 
         # Buffers
         in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
+        # Base points buffer (16 u32s per point: 8 for x, 8 for y)
+        base_points_buffer = self.device.newBufferWithLength_options_(count * 16 * 4, 0)
         # 索引buff
         index_compact_buffer = self.device.newBufferWithLength_options_(4, 0)
         # 输出计数buff
@@ -763,32 +800,54 @@ KERNEL_FQ void vanity_kernel_compact(
 
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
-        enc = cb.computeCommandEncoder()
-        # Build or reuse a specialized pipeline for this steps_per_thread
-        pipeline = self._ensure_walk_pipelines(steps_per_thread)
-        enc.setComputePipelineState_(pipeline)
-        enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
-        enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
-        enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
+        
+        # Build or reuse specialized pipelines for this steps_per_thread
+        compute_base_pipeline, walk_pipeline = self._ensure_walk_pipelines(steps_per_thread)
+
+        # Stage 1: Compute base points from private keys
+        enc1 = cb.computeCommandEncoder()
+        enc1.setComputePipelineState_(compute_base_pipeline)
+        enc1.setBuffer_offset_atIndex_(in_buffer, 0, 0)
+        enc1.setBuffer_offset_atIndex_(base_points_buffer, 0, 1)
         try:
-            enc.setBytes_length_atIndex_(bytes(p), 16, 3)
+            enc1.setBytes_length_atIndex_(bytes(p), 16, 2)
         except Exception:
             params_buffer = self.device.newBufferWithLength_options_(16, 0)
             params_buffer.contents().as_buffer(16)[:16] = bytes(p)
-            enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
+            enc1.setBuffer_offset_atIndex_(params_buffer, 0, 2)
+        
+        print(f'compute_base_pipeline thread_execution_width: {compute_base_pipeline.threadExecutionWidth()}')
+        max_threads = int(compute_base_pipeline.maxTotalThreadsPerThreadgroup())
+        print(f'compute_base_pipeline max_threads: {max_threads}')
 
-        w = int(self.thread_execution_width)
+        tpt = 32
+        tg = MTLSizeMake(tpt, 1, 1)
+        grid = MTLSizeMake(count, 1, 1)
+        enc1.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+        enc1.endEncoding()
+        
+        # Stage 2: Walker using precomputed base points
+        enc2 = cb.computeCommandEncoder()
+        enc2.setComputePipelineState_(walk_pipeline)
+        enc2.setBuffer_offset_atIndex_(base_points_buffer, 0, 0)
+        enc2.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
+        enc2.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         try:
-            max_threads = int(pipeline.maxTotalThreadsPerThreadgroup())
-            print(f'max_threads: {max_threads}')
+            enc2.setBytes_length_atIndex_(bytes(p), 16, 3)
         except Exception:
-            max_threads = 256
+            if 'params_buffer' not in locals():
+                params_buffer = self.device.newBufferWithLength_options_(16, 0)
+                params_buffer.contents().as_buffer(16)[:16] = bytes(p)
+            enc2.setBuffer_offset_atIndex_(params_buffer, 0, 3)
+        print(f'walk_pipeline thread_execution_width: {walk_pipeline.threadExecutionWidth()}')
+        max_threads = int(walk_pipeline.maxTotalThreadsPerThreadgroup())
+        print(f'walk_pipeline max_threads: {max_threads}')
         tpt = 64
         print(f'tpt: {tpt}')
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(count, 1, 1)
-        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
-        enc.endEncoding()
+        enc2.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+        enc2.endEncoding()
 
         job = MetalVanity.VanityJobCompact(cb, index_compact_buffer, out_count_buffer, capacity_count)
         job.effective_steps_per_thread = int(steps_per_thread)
