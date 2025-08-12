@@ -64,6 +64,9 @@ class MetalVanity:
 #define T_STEPS 16
 #endif
 
+// Fixed window size for sliding batch processing to avoid stack overflow
+#define BATCH_WINDOW_SIZE 480
+
 // Precomputed basepoint table in constant memory to be shared across all threads
 constant secp256k1_t G_PRECOMP = { {
     SECP256K1_G_PRE_COMPUTED_00, SECP256K1_G_PRE_COMPUTED_01, SECP256K1_G_PRE_COMPUTED_02, SECP256K1_G_PRE_COMPUTED_03,
@@ -131,6 +134,8 @@ inline void keccak_f1600_inline(thread ulong a[25]) {
 }
 inline ulong load64_thread(const thread uchar *src){ ulong v=0; for(ushort i=0;i<8;++i) v|=((ulong)src[i])<<(8*i); return v; }
 inline void store64_le(ulong v, thread uchar *dst){ for(ushort i=0;i<8;++i) dst[i]=(uchar)((v>>(8*i))&0xFF); }
+
+
 inline void keccak256_64(const thread uchar *msg64, thread uchar *out32){
     ulong A[25];
     for (ushort i=0;i<25;++i) A[i]=0UL;
@@ -396,6 +401,88 @@ KERNEL_FQ void vanity_kernel_compact(
         for (ushort i=0;i<8;++i){ gy[i] = G_PRECOMP.xy[8 + i]; }
     }
 
+    // Sliding window batch processing function for walker
+    // Processes up to BATCH_WINDOW_SIZE steps at a time using stack arrays
+    inline void process_walker_batch(
+        thread u32 *base_x, thread u32 *base_y, thread u32 *base_z,
+        thread const u32 *dx, thread const u32 *dy,
+        uint batch_start, uint batch_size, uint total_steps,
+        device uchar *addr_compact_out, device uint *index_compact_out, 
+        device atomic_uint *out_count, uint gid, uint want, uint nibs) 
+    {
+        // Stack arrays for this batch - fixed size to avoid overflow
+        u32 xs[BATCH_WINDOW_SIZE][8];
+        u32 ys[BATCH_WINDOW_SIZE][8]; 
+        u32 zs[BATCH_WINDOW_SIZE][8];
+        u32 pref[BATCH_WINDOW_SIZE][8];
+        
+        // Start from base point for this batch
+        u32 xj[8], yj[8], zj[8];
+        for (ushort i=0;i<8;++i){ xj[i]=base_x[i]; yj[i]=base_y[i]; zj[i]=base_z[i]; }
+        
+        // Generate batch_size points by repeated addition
+        for (uint i=0; i<batch_size; ++i){
+            for (ushort k=0;k<8;++k){ xs[i][k]=xj[k]; ys[i][k]=yj[k]; zs[i][k]=zj[k]; }
+            // Copy dx, dy to non-const arrays for point_add
+            u32 temp_dx[8], temp_dy[8];
+            for (ushort k=0;k<8;++k){ temp_dx[k]=dx[k]; temp_dy[k]=dy[k]; }
+            point_add(xj, yj, zj, temp_dx, temp_dy);
+        }
+        
+        // Update base point for next batch
+        for (ushort i=0;i<8;++i){ base_x[i]=xj[i]; base_y[i]=yj[i]; base_z[i]=zj[i]; }
+        
+        // Batch inversion using Montgomery trick
+        for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
+        for (uint i=1; i<batch_size; ++i){
+            mul_mod(pref[i], pref[i-1], zs[i]);
+        }
+        
+        // Inverse total
+        u32 inv_total[8];
+        for (ushort k=0;k<8;++k){ inv_total[k] = pref[batch_size-1][k]; }
+        inv_mod(inv_total);
+        
+        // Backward pass and vanity check
+        for (int ii=(int)batch_size-1; ii>=0; --ii){
+            u32 inv_z[8];
+            if (ii == 0){
+                for (ushort k=0;k<8;++k){ inv_z[k]=inv_total[k]; }
+            } else {
+                mul_mod(inv_z, inv_total, pref[ii-1]);
+            }
+            mul_mod(inv_total, inv_total, zs[ii]);
+            
+            // Convert to affine coordinates
+            u32 z2[8]; for (ushort k=0;k<8;++k) z2[k]=inv_z[k];
+            mul_mod(z2, z2, z2);
+            u32 xa[8]; for (ushort k=0;k<8;++k) xa[k]=xs[ii][k]; mul_mod(xa, xa, z2);
+            u32 z3[8]; mul_mod(z3, z2, inv_z);
+            u32 ya[8]; for (ushort k=0;k<8;++k) ya[k]=ys[ii][k]; mul_mod(ya, ya, z3);
+            
+            // Pack public key and compute Keccak
+            uchar pub[64];
+            for (ushort k=0;k<8;++k){ u32 w=xa[7-k]; ushort off=k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+            for (ushort k=0;k<8;++k){ u32 w=ya[7-k]; ushort off=32+k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+            
+            uchar digest[32]; keccak256_64(pub, digest);
+            
+            // Vanity check
+            bool ok = true;
+            uchar want_byte = (uchar)((want << 4) | want);
+            uint full = nibs >> 1; uint rem = nibs & 1u;
+            for (uint b = 0; b < full; ++b) { if (digest[12 + b] != want_byte) { ok = false; break; } }
+            if (ok && rem) { uchar bb = digest[12 + full]; if ((bb >> 4) != want) ok = false; }
+            
+            if (ok){
+                uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                device uchar *addr = addr_compact_out + idx * 20;
+                for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
+                index_compact_out[idx] = gid * total_steps + batch_start + (uint)ii;
+            }
+        }
+    }
+
     // Non-w16 walker (fallback): uses point_mul_xy with precomputed G
     KERNEL_FQ void vanity_kernel_walk_compact(
         device const uchar *priv_in                  [[ buffer(0) ]],
@@ -419,137 +506,24 @@ KERNEL_FQ void vanity_kernel_compact(
         u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
 
         const uint steps = params->steps;
-        uint T = steps; if (T > (uint)T_STEPS) T = (uint)T_STEPS;
+        uint want = params->nibble & 0xF; 
+        uint nibs = params->nibbleCount;
 
-        // Storage for up to T_STEPS Jacobian points
-        u32 xs[T_STEPS][8]; u32 ys[T_STEPS][8]; u32 zs[T_STEPS][8];
+        // Convert to Jacobian for batch processing
+        u32 base_x[8], base_y[8], base_z[8];
+        for (ushort i=0;i<8;++i){ base_x[i]=x0[i]; base_y[i]=y0[i]; base_z[i]=0; }
+        base_z[0]=1;
 
-        // Start in Jacobian with z=1
-        u32 xj[8]; u32 yj[8]; u32 zj[8];
-        for (ushort i=0;i<8;++i){ xj[i]=x0[i]; yj[i]=y0[i]; zj[i]=0; }
-        zj[0]=1;
-
-        // Walk T steps, saving each point, then advance by +G
-        for (uint i=0;i<T; ++i){
-            for (ushort k=0;k<8;++k){ xs[i][k]=xj[k]; ys[i][k]=yj[k]; zs[i][k]=zj[k]; }
-            point_add(xj, yj, zj, dx, dy);
-        }
-
-        // Batch inversion of z's via Montgomery trick
-        u32 pref[T_STEPS][8];
-        // pref[0] = z0
-        for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
-        for (uint i=1;i<T; ++i){ mul_mod(pref[i], pref[i-1], zs[i]); }
-        // inv_total = 1/pref[T-1]
-        u32 inv_total[8];
-        for (ushort k=0;k<8;++k){ inv_total[k] = pref[T-1][k]; }
-        inv_mod(inv_total);
-        // Backward pass
-        for (int ii=(int)T-1; ii>=0; --ii){
-            u32 inv_z[8];
-            if (ii == 0){
-                for (ushort k=0;k<8;++k){ inv_z[k]=inv_total[k]; }
-            } else {
-                mul_mod(inv_z, inv_total, pref[ii-1]);
-            }
-            // inv_total *= z[ii]
-            mul_mod(inv_total, inv_total, zs[ii]);
-
-            // Affine conversion: x = x * inv_z^2; y = y * inv_z^3
-            u32 z2[8]; for (ushort k=0;k<8;++k) z2[k]=inv_z[k];
-            mul_mod(z2, z2, z2);
-            u32 xa[8]; for (ushort k=0;k<8;++k) xa[k]=xs[ii][k]; mul_mod(xa, xa, z2);
-            u32 z3[8]; mul_mod(z3, z2, inv_z);
-            u32 ya[8]; for (ushort k=0;k<8;++k) ya[k]=ys[ii][k]; mul_mod(ya, ya, z3);
-
-            // pack pub (x||y) big-endian
-            uchar pub[64];
-            for (ushort k=0;k<8;++k){ u32 w=xa[7-k]; ushort off=k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-            for (ushort k=0;k<8;++k){ u32 w=ya[7-k]; ushort off=32+k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-
-            // keccak + vanity check
-            uchar digest[32]; keccak256_64(pub, digest);
-            uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
-            uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
-            for (uint b = 0; b < full; ++b) { if (digest[12 + b] != want_byte) { ok = false; break; } }
-            if (ok && rem) { uchar bb = digest[12 + full]; if ((bb >> 4) != want) ok = false; }
-            if (ok){
-                uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                device uchar *addr = addr_compact_out + idx * 20;
-                for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
-                index_compact_out[idx] = (uint)(gid * T + (uint)ii);
-            }
+        // Process in batches of BATCH_WINDOW_SIZE to avoid stack overflow
+        uint processed = 0;
+        while (processed < steps) {
+            uint batch_size = (steps - processed > BATCH_WINDOW_SIZE) ? BATCH_WINDOW_SIZE : (steps - processed);
+            process_walker_batch(base_x, base_y, base_z, dx, dy, processed, batch_size, steps,
+                                addr_compact_out, index_compact_out, out_count, gid, want, nibs);
+            processed += batch_size;
         }
     }
 
-    // w16 walker: uses precomputed g16 table for the initial multiply
-    KERNEL_FQ void vanity_kernel_walk_w16_compact(
-        device const uchar *priv_in                  [[ buffer(0) ]],
-        device uchar *addr_compact_out               [[ buffer(1) ]],
-        device uint *index_compact_out               [[ buffer(2) ]],
-        device atomic_uint *out_count                [[ buffer(3) ]],
-        device const WalkParams *params              [[ buffer(4) ]],
-        device const uchar *g16_table                [[ buffer(5) ]],
-        uint gid                                     [[ thread_position_in_grid ]])
-    {
-        uint count = params->count; if (gid >= count) return;
-        const device uchar *p = priv_in + gid * 32;
-        u32 k_be[8];
-        for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
-        u32 k_local[8];
-        k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3];
-        k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
-
-        // Base point P0 = k*G (affine) via w16
-        u32 x0[8]; u32 y0[8]; point_mul_xy_w16(x0, y0, k_local, g16_table);
-        // Prepare delta = G (affine)
-        u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
-
-        const uint steps = params->steps;
-        uint T = steps; if (T > (uint)T_STEPS) T = (uint)T_STEPS;
-
-        u32 xs[T_STEPS][8]; u32 ys[T_STEPS][8]; u32 zs[T_STEPS][8];
-        u32 xj[8]; u32 yj[8]; u32 zj[8];
-        for (ushort i=0;i<8;++i){ xj[i]=x0[i]; yj[i]=y0[i]; zj[i]=0; }
-        zj[0]=1;
-
-        for (uint i=0;i<T; ++i){
-            for (ushort k=0;k<8;++k){ xs[i][k]=xj[k]; ys[i][k]=yj[k]; zs[i][k]=zj[k]; }
-            point_add(xj, yj, zj, dx, dy);
-        }
-
-        u32 pref[T_STEPS][8];
-        for (ushort k=0;k<8;++k){ pref[0][k] = zs[0][k]; }
-        for (uint i=1;i<T; ++i){ mul_mod(pref[i], pref[i-1], zs[i]); }
-        u32 inv_total[8]; for (ushort k=0;k<8;++k){ inv_total[k] = pref[T-1][k]; }
-        inv_mod(inv_total);
-        for (int ii=(int)T-1; ii>=0; --ii){
-            u32 inv_z[8];
-            if (ii == 0){ for (ushort k=0;k<8;++k){ inv_z[k]=inv_total[k]; } }
-            else { mul_mod(inv_z, inv_total, pref[ii-1]); }
-            mul_mod(inv_total, inv_total, zs[ii]);
-
-            u32 z2[8]; for (ushort k=0;k<8;++k) z2[k]=inv_z[k]; mul_mod(z2, z2, z2);
-            u32 xa[8]; for (ushort k=0;k<8;++k) xa[k]=xs[ii][k]; mul_mod(xa, xa, z2);
-            u32 z3[8]; mul_mod(z3, z2, inv_z); u32 ya[8]; for (ushort k=0;k<8;++k) ya[k]=ys[ii][k]; mul_mod(ya, ya, z3);
-
-            uchar pub[64];
-            for (ushort k=0;k<8;++k){ u32 w=xa[7-k]; ushort off=k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-            for (ushort k=0;k<8;++k){ u32 w=ya[7-k]; ushort off=32+k*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
-
-            uchar digest[32]; keccak256_64(pub, digest);
-            uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
-            uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
-            for (uint b = 0; b < full; ++b) { if (digest[12 + b] != want_byte) { ok = false; break; } }
-            if (ok && rem) { uchar bb = digest[12 + full]; if ((bb >> 4) != want) ok = false; }
-            if (ok){
-                uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                device uchar *addr = addr_compact_out + idx * 20;
-                for (ushort k=0;k<20;++k) addr[k] = digest[12 + k];
-                index_compact_out[idx] = (uint)(gid * T + (uint)ii);
-            }
-        }
-    }
 '''
         )
 
@@ -584,7 +558,6 @@ KERNEL_FQ void vanity_kernel_compact(
         fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
         fn_builder = library.newFunctionWithName_("g16_builder_kernel")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
-        fn_walk_w16 = library.newFunctionWithName_("vanity_kernel_walk_w16_compact")
         if fn_w16 is not None and fn_w16c is not None:
             p_w16, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16, None)
             if p_w16 is not None:
@@ -599,22 +572,16 @@ KERNEL_FQ void vanity_kernel_compact(
                 self.pipeline_builder = p_b
         # Walker pipelines
         self.pipeline_walk_compact = None
-        self.pipeline_walk_w16_compact = None
         if fn_walk is not None:
             p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
             if p_wc is not None:
                 self.pipeline_walk_compact = p_wc
-        if fn_walk_w16 is not None:
-            p_wwc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk_w16, None)
-            if p_wwc is not None:
-                self.pipeline_walk_w16_compact = p_wwc
 
         # Single command queue is sufficient; command buffers pipeline naturally
         self.queue = self.device.newCommandQueue()
         self.thread_execution_width = self.pipeline.threadExecutionWidth()
         # Pipeline caches for specialized walkers
         self._walk_pipelines = {}
-        self._walk_w16_pipelines = {}
         # Keep no reusable buffers here; API supports overlapping jobs, so use per-job buffers
         # Load optional 16-bit window precomputed table from disk if available
         self.g16_buffer = None
@@ -822,9 +789,9 @@ KERNEL_FQ void vanity_kernel_compact(
 
     def _ensure_walk_pipelines(self, steps_per_thread: int):
         key = int(steps_per_thread)
-        # Return cached pipelines if present
+        # Return cached pipeline if present
         if key in self._walk_pipelines:
-            return self._walk_pipelines[key], self._walk_w16_pipelines.get(key)
+            return self._walk_pipelines[key]
         # Compile specialized library with T_STEPS macro
         specialized = f"#define T_STEPS {key}\n" + self._source_template
         library, error = self.device.newLibraryWithSource_options_error_(specialized, None, None)
@@ -836,13 +803,8 @@ KERNEL_FQ void vanity_kernel_compact(
         p_wc, error = self.device.newComputePipelineStateWithFunction_error_(fn_walk, None)
         if p_wc is None:
             raise RuntimeError(f"Failed to create specialized walk pipeline for steps={key}: {error}")
-        fn_walk_w16 = library.newFunctionWithName_("vanity_kernel_walk_w16_compact")
-        p_wwc = None
-        if fn_walk_w16 is not None:
-            p_wwc, _ = self.device.newComputePipelineStateWithFunction_error_(fn_walk_w16, None)
         self._walk_pipelines[key] = p_wc
-        self._walk_w16_pipelines[key] = p_wwc
-        return p_wc, p_wwc
+        return p_wc
 
     def wait_and_collect_compact(self, job: "MetalVanity.VanityJobCompact") -> Tuple[List[bytes], List[int], int]:
         job._done_event.wait()
@@ -891,11 +853,8 @@ KERNEL_FQ void vanity_kernel_compact(
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
         enc = cb.computeCommandEncoder()
-        use_w16 = False
         # Build or reuse a specialized pipeline for this steps_per_thread
-        pipeline, pipeline_w16 = self._ensure_walk_pipelines(steps_per_thread)
-        if use_w16 and pipeline_w16 is not None and self.g16_buffer is not None:
-            pipeline = pipeline_w16
+        pipeline = self._ensure_walk_pipelines(steps_per_thread)
         enc.setComputePipelineState_(pipeline)
         enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc.setBuffer_offset_atIndex_(addr_compact_buffer, 0, 1)
@@ -907,8 +866,6 @@ KERNEL_FQ void vanity_kernel_compact(
             params_buffer = self.device.newBufferWithLength_options_(16, 0)
             params_buffer.contents().as_buffer(16)[:16] = bytes(p)
             enc.setBuffer_offset_atIndex_(params_buffer, 0, 4)
-        if use_w16:
-            enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 5)
 
         w = int(self.thread_execution_width)
         try:
