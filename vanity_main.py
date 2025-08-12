@@ -2,7 +2,7 @@ import os
 import time
 from typing import Optional
 
-from gpu_vanity import MetalVanity, generate_valid_privkeys, SECP256K1_ORDER_INT
+from gpu_vanity import MetalVanity, generate_valid_privkeys, SECP256K1_ORDER_INT,generate_valid_privkeys
 
 
 def hex_addr(b: bytes) -> str:
@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_batches: Optional[int] = None, steps_per_thread: int = 32) -> None:
+def main(batch_size: int = 2048, nibble: int = 0x8, nibble_count: int = 6, max_batches: Optional[int] = None, steps_per_thread: int = 512) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
@@ -27,7 +27,7 @@ def main(batch_size: int = 4096, nibble: int = 0x8, nibble_count: int = 5, max_b
         # print(f'batch {batches}')
         # Prepare and immediately commit the next batch so a command is always in-flight
         t_gen = time.perf_counter()
-        privs_next = generate_valid_privkeys(batch_size)
+        privs_next = generate_valid_privkeys(batch_size ,steps_per_thread,128)
         gen_next_sec = time.perf_counter() - t_gen
         job_next = engine.encode_and_commit_walk_compact(privs_next, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
 
