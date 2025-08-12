@@ -2,7 +2,7 @@ import os
 import time
 from typing import Optional
 
-from gpu_vanity import MetalVanity, generate_valid_privkeys, SECP256K1_ORDER_INT
+from gpu_vanity import MetalVanity, generate_valid_privkeys, generate_walk_start_privkeys, SECP256K1_ORDER_INT
 
 
 def hex_addr(b: bytes) -> str:
@@ -10,13 +10,14 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 8) -> None:
+def main(batch_size: int = 4096*128//8, nibble: int = 0x8, nibble_count: int = 8, max_batches: Optional[int] = None, steps_per_thread: int = 4) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
     # Double-buffering with compact GPU output to minimize readback
     t_gen0 = time.perf_counter()
-    privs_prev = generate_valid_privkeys(batch_size)
+    # Generate spaced starting keys to avoid cross-thread overlap for walker
+    privs_prev = generate_walk_start_privkeys(batch_size, steps_per_thread)
     gen_prev_sec = time.perf_counter() - t_gen0
     job_prev = engine.encode_and_commit_walk_compact(privs_prev, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
     start_time = time.perf_counter()
@@ -27,7 +28,7 @@ def main(batch_size: int = 4096*256, nibble: int = 0x8, nibble_count: int = 8, m
         # print(f'batch {batches}')
         # Prepare and immediately commit the next batch so a command is always in-flight
         t_gen = time.perf_counter()
-        privs_next = generate_valid_privkeys(batch_size)
+        privs_next = generate_walk_start_privkeys(batch_size, steps_per_thread)
         gen_next_sec = time.perf_counter() - t_gen
         job_next = engine.encode_and_commit_walk_compact(privs_next, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count)
 

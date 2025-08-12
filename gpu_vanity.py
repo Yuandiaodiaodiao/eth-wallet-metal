@@ -20,7 +20,7 @@ from Metal import MTLCreateSystemDefaultDevice, MTLSizeMake
 
 # Integer curve order for fast modular arithmetic
 SECP256K1_ORDER_INT = int.from_bytes(SECP256K1_ORDER_BYTES, "big")
-
+print(f"SECP256K1_ORDER_INT: {SECP256K1_ORDER_INT}")
 # Optional NumPy acceleration (SIMD on Apple Silicon)
 try:
     import numpy as np  # type: ignore
@@ -905,8 +905,6 @@ KERNEL_FQ void vanity_kernel_compact(
             raise ValueError("privkeys_be32 must not be empty")
         if steps_per_thread <= 0:
             raise ValueError("steps_per_thread must be > 0")
-        if steps_per_thread > 16:
-            steps_per_thread = 16
         for i, k in enumerate(privkeys_be32):
             if len(k) != 32:
                 raise ValueError(f"privkey[{i}] must be 32 bytes")
@@ -1001,6 +999,33 @@ def generate_valid_privkeys(batch_size: int) -> List[bytes]:
     if HAS_NUMPY:
         return _generate_privkeys_incremental_numpy(batch_size)
     raise NotImplementedError("NumPy is not installed")
+
+
+def generate_walk_start_privkeys(batch_size: int, steps_per_thread: int) -> List[bytes]:
+    """Generate starting private keys for the walker kernel such that
+    each thread's T-step walk does not overlap with others. Starts are spaced by steps_per_thread.
+
+    This uses a lightweight Python big-int loop for correctness. Cost is negligible relative to GPU work.
+    """
+    if steps_per_thread <= 0:
+        raise ValueError("steps_per_thread must be > 0")
+    out: List[bytes] = []
+    n = SECP256K1_ORDER_INT
+    base = int.from_bytes(secrets.token_bytes(32), "big") % n
+    if base == 0:
+        base = 1
+    step = steps_per_thread % n
+    if step == 0:
+        step = 1
+    k = base
+    for _ in range(batch_size):
+        out.append(k.to_bytes(32, "big"))
+        k += step
+        if k >= n:
+            k -= n
+        if k == 0:
+            k = 1
+    return out
 
 def _generate_privkeys_incremental_python(batch_size: int, seq_len: int = 8192) -> List[bytes]:
     out: List[bytes] = []
