@@ -4,6 +4,35 @@ from typing import List
 from .constants import SECP256K1_ORDER_BYTES, SECP256K1_ORDER_INT, HAS_NUMPY
 
 
+def generate_private_keys(count: int) -> List[bytes]:
+    """
+    Generate cryptographically secure random private keys
+    
+    Args:
+        count: Number of private keys to generate
+        
+    Returns:
+        List of 32-byte private keys
+    """
+    keys = []
+    for _ in range(count):
+        # Generate 32 random bytes
+        key = secrets.token_bytes(32)
+        
+        # Ensure the key is valid for secp256k1
+        # Private key must be in range [1, n-1] where n is the order of the curve
+        # For practical purposes, any 32-byte value except 0 and values >= n are invalid
+        # The probability of generating such values is negligible (< 2^-128)
+        
+        # Check for zero (extremely unlikely)
+        if key == b'\x00' * 32:
+            key = secrets.token_bytes(32)
+        
+        keys.append(key)
+    
+    return keys
+
+
 def generate_valid_privkeys(batch_size: int, steps_per_thread: int = 1, seq_len: int = 8192) -> List[bytes]:
     if HAS_NUMPY:
         return _generate_privkeys_incremental_numpy(batch_size, steps_per_thread, seq_len)

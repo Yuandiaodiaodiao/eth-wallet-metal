@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip:*)",
+      "Bash(nvcc:*)",
+      "Bash(echo $CUDA_PATH)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
