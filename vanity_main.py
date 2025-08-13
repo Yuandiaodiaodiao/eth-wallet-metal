@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 6, max_batches: Optional[int] = None, steps_per_thread: int = 256*16, prefix_hex: Optional[str] = "000000", suffix_hex: Optional[str] = "000000") -> None:
+def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_thread: int = 256*16, prefix_hex: Optional[str] = "000000", suffix_hex: Optional[str] = "000000") -> None:
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vanity")
     engine = MetalVanity(here)
     batches = 0
@@ -22,12 +22,12 @@ def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 6, max_
     t_gen0 = time.perf_counter()
     privs_0 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
     gen_0_sec = time.perf_counter() - t_gen0
-    job_0 = engine.encode_and_commit_walk_compact(privs_0, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
+    job_0 = engine.encode_and_commit_walk_compact(privs_0, steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
     
     t_gen1 = time.perf_counter()
     privs_1 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
     gen_1_sec = time.perf_counter() - t_gen1
-    job_1 = engine.encode_and_commit_walk_compact(privs_1, steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
+    job_1 = engine.encode_and_commit_walk_compact(privs_1, steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
     
     # Circular buffer indices
     current_buffer = 0
@@ -74,12 +74,12 @@ def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 6, max_
                 k = 1
             k_bytes = k.to_bytes(32, "big")
             # Verify address for this priv using a direct compact kernel call
-            verify_job = engine.encode_and_commit_walk_compact([k_bytes], steps_per_thread=1, nibble=0x0, nibble_count=0, prefix_hex=None, suffix_hex=None)
+            verify_job = engine.encode_and_commit_walk_compact([k_bytes], steps_per_thread=1, prefix_hex=None, suffix_hex=None)
             v_indices, _ = engine.wait_and_collect_compact(verify_job)
             print(f'walk indices: {v_indices}')
             
             print("\nTesting compact:")
-            verify_job_correct = engine.encode_and_commit_compact([k_bytes], nibble=0x0, nibble_count=0, prefix_hex=None, suffix_hex=None)
+            verify_job_correct = engine.encode_and_commit_compact([k_bytes], prefix_hex=None, suffix_hex=None)
             indices, _ = engine.wait_and_collect_compact(verify_job_correct)
             
             print(f'compact indices: {indices}')
@@ -96,7 +96,7 @@ def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 6, max_
         t_gen = time.perf_counter()
         privs[oldest_idx] = generate_valid_privkeys(batch_size, steps_per_thread, 128)
         gen_times[oldest_idx] = time.perf_counter() - t_gen
-        jobs[oldest_idx] = engine.encode_and_commit_walk_compact(privs[oldest_idx], steps_per_thread=steps_per_thread, nibble=nibble, nibble_count=nibble_count, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
+        jobs[oldest_idx] = engine.encode_and_commit_walk_compact(privs[oldest_idx], steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
         
         # Move to next buffer in circular fashion
         current_buffer = (current_buffer + 1) % len(jobs)

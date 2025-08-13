@@ -496,7 +496,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
             self.gpu_start_time: float = -1.0
             self.gpu_end_time: float = -1.0
 
-    def _pack_prefix_pattern(self, nibble: int, nibble_count: int, prefix_hex: Optional[str]) -> Tuple[bytes, int]:
+    def _pack_prefix_pattern(self, prefix_hex: Optional[str]) -> Tuple[bytes, int]:
         # Returns (20-byte pattern, nibble_count)
         if prefix_hex is not None and len(prefix_hex) > 0:
             s = prefix_hex.lower().strip()
@@ -510,10 +510,9 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
             # convert to nibbles
             nibbles: List[int] = [int(ch, 16) for ch in s[:nibs]]
         else:
-            # legacy repeated nibble
-            want = int(nibble) & 0xF
-            nibs = max(0, int(nibble_count))
-            nibbles = [want] * min(nibs, 40)
+            # empty prefix
+            nibs = 0
+            nibbles = []
         # pack two nibbles per byte
         full = nibs // 2
         rem = nibs & 1
@@ -552,7 +551,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
             pat[full] = ((hi & 0xF) << 4)
         return (bytes(pat), nibs)
 
-    def encode_and_commit_compact(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7, prefix_hex: Optional[str] = None, suffix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
+    def encode_and_commit_compact(self, privkeys_be32: List[bytes], prefix_hex: Optional[str] = None, suffix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
         if not privkeys_be32:
             raise ValueError("privkeys_be32 must not be empty")
         for i, k in enumerate(privkeys_be32):
@@ -578,7 +577,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
 
         # params: VanityParams {count, nibbleCount, pattern[20], suffixNibbleCount, suffixPattern[20]}
-        pattern, nibs = self._pack_prefix_pattern(nibble, nibble_count, prefix_hex)
+        pattern, nibs = self._pack_prefix_pattern(prefix_hex)
         spat, snibs = self._pack_suffix_pattern(suffix_hex)
         p = bytearray(52)
         p[0:4] = int(count).to_bytes(4, "little")
@@ -687,7 +686,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         return job._indices or [], job.effective_steps_per_thread
 
 
-    def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, nibble: int = 0x8, nibble_count: int = 7, prefix_hex: Optional[str] = None, suffix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
+    def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, prefix_hex: Optional[str] = None, suffix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
         if not privkeys_be32:
             raise ValueError("privkeys_be32 must not be empty")
         if steps_per_thread <= 0:
@@ -718,7 +717,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
 
         # params: WalkParams {count, nibbleCount, steps, pattern[20], suffixNibbleCount, suffixPattern[20]}
-        pattern, nibs = self._pack_prefix_pattern(nibble, nibble_count, prefix_hex)
+        pattern, nibs = self._pack_prefix_pattern(prefix_hex)
         spat, snibs = self._pack_suffix_pattern(suffix_hex)
         p = bytearray(52)
         p[0:4] = int(count).to_bytes(4, "little")
