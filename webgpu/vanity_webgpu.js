@@ -50,7 +50,7 @@ export class WebGPUVanity {
     if (count === 0) throw new Error('No keys');
     const inSize = 32 * count;
     const inBuf = this.device.createBuffer({ size: inSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const idxBuf = this.device.createBuffer({ size: 4 * count, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const idxBuf = this.device.createBuffer({ size: 4 , usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const cntBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     // upload inputs
     {
@@ -86,9 +86,9 @@ export class WebGPUVanity {
     pass.end();
 
     // readback
-    const readIdx = this.device.createBuffer({ size: 4 * count, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const readIdx = this.device.createBuffer({ size: 4 , usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const readCnt = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    enc.copyBufferToBuffer(idxBuf, 0, readIdx, 0, 4 * count);
+    enc.copyBufferToBuffer(idxBuf, 0, readIdx, 0, 4);
     enc.copyBufferToBuffer(cntBuf, 0, readCnt, 0, 4);
     this.device.queue.submit([enc.finish()]);
     await this.device.queue.onSubmittedWorkDone();
@@ -108,13 +108,15 @@ export class WebGPUVanity {
 
   // encode_and_commit_walk_compact equivalent (two-stage: compute base, walk)
   async encodeAndCommitWalkCompact(privkeysBE32, stepsPerThread = 8, nibble = 0x8, nibbleCount = 7) {
+    console.log('111')
     await this.ensurePipelines();
+    console.log('encodeAndCommitWalkCompact',privkeysBE32); 
     const count = privkeysBE32.length;
     const capacity = count * stepsPerThread;
     const inSize = 32 * count;
     const inBuf = this.device.createBuffer({ size: inSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const baseBuf = this.device.createBuffer({ size: count * 16 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-    const idxBuf = this.device.createBuffer({ size: 4 * Math.max(1, capacity), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const idxBuf = this.device.createBuffer({ size: 4 * 1, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const cntBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     // upload inputs
     {
@@ -168,9 +170,9 @@ export class WebGPUVanity {
     }
 
     // readback
-    const readIdx = this.device.createBuffer({ size: 4 * Math.max(1, capacity), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const readIdx = this.device.createBuffer({ size: 4 , usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const readCnt = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    enc.copyBufferToBuffer(idxBuf, 0, readIdx, 0, 4 * Math.max(1, capacity));
+    enc.copyBufferToBuffer(idxBuf, 0, readIdx, 0, 4 );
     enc.copyBufferToBuffer(cntBuf, 0, readCnt, 0, 4);
     this.device.queue.submit([enc.finish()]);
     await this.device.queue.onSubmittedWorkDone();

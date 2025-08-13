@@ -413,6 +413,70 @@ fn inv_mod_p(a: ptr<function, U256>) -> U256 {
   return res;
 }
 
+fn u256_is_zero(a: ptr<function, U256>) -> bool {
+  var z: u32 = 0u;
+  for (var i:u32=0u;i<8u;i++){ z |= (*a).w[i]; }
+  return z == 0u;
+}
+
+fn u256_eq(a: ptr<function, U256>, b: ptr<function, U256>) -> bool {
+  var z: u32 = 0u;
+  for (var i:u32=0u;i<8u;i++){ z |= ((*a).w[i] ^ (*b).w[i]); }
+  return z == 0u;
+}
+
+// Base point G (secp256k1) affine coordinates in little-endian 32-bit limbs
+fn load_G_affine(gx: ptr<function, U256>, gy: ptr<function, U256>) {
+  // Gx = 79BE667E F9DCBBAC 55A06295 CE870B07 029BFCDB 2DCE28D9 59F2815B 16F81798
+  (*gx).w[0]=0x16F81798u; (*gx).w[1]=0x59F2815Bu; (*gx).w[2]=0x2DCE28D9u; (*gx).w[3]=0x029BFCDBu;
+  (*gx).w[4]=0xCE870B07u; (*gx).w[5]=0x55A06295u; (*gx).w[6]=0xF9DCBBACu; (*gx).w[7]=0x79BE667Eu;
+  // Gy = 483ADA77 26A3C465 5DA4FBFC 0E1108A8 FD17B448 A6855419 9C47D08F FB10D4B8
+  (*gy).w[0]=0xFB10D4B8u; (*gy).w[1]=0x9C47D08Fu; (*gy).w[2]=0xA6855419u; (*gy).w[3]=0xFD17B448u;
+  (*gy).w[4]=0x0E1108A8u; (*gy).w[5]=0x5DA4FBFCu; (*gy).w[6]=0x26A3C465u; (*gy).w[7]=0x483ADA77u;
+}
+
+fn point_add_jacobian_affine(X1: ptr<function, U256>, Y1: ptr<function, U256>, Z1: ptr<function, U256>, x2: ptr<function, U256>, y2: ptr<function, U256>) {
+  // Handle infinity cases
+  if (u256_is_zero(Z1)) {
+    // P is infinity -> set to Q in Jacobian (Z=1)
+    for (var i:u32=0u;i<8u;i++){ (*X1).w[i]=(*x2).w[i]; (*Y1).w[i]=(*y2).w[i]; (*Z1).w[i]=0u; }
+    (*Z1).w[0]=1u; return;
+  }
+  // U2 = x2 * Z1^2; S2 = y2 * Z1^3
+  var Z1Z1 = sqr_mod_p(Z1);
+  var Z1Z1Z1 = mul_mod_p(&Z1Z1, Z1);
+  var U2 = mul_mod_p(x2, &Z1Z1);
+  var S2 = mul_mod_p(y2, &Z1Z1Z1);
+  var H = sub_mod_p(&U2, X1);
+  var R = sub_mod_p(&S2, Y1);
+  if (u256_is_zero(&H)) {
+    if (u256_is_zero(&R)) {
+      // P==Q -> use doubling (not implemented here); fallback: leave point unchanged
+      return;
+    } else {
+      // result is infinity
+      for (var i:u32=0u;i<8u;i++){ (*Z1).w[i]=0u; (*X1).w[i]=0u; (*Y1).w[i]=0u; }
+      return;
+    }
+  }
+  var HH = mul_mod_p(&H, &H);
+  var HHH = mul_mod_p(&HH, &H);
+  var U1HH = mul_mod_p(X1, &HH);
+  var R2 = mul_mod_p(&R, &R);
+  var tmp1 = sub_mod_p(&R2, &HHH);
+  var U1HH_dbl = add_mod_p(&U1HH, &U1HH);
+  var X3 = sub_mod_p(&tmp1, &U1HH_dbl);
+  var tmp2 = sub_mod_p(&U1HH, &X3);
+  var tmp3 = mul_mod_p(&R, &tmp2);
+  var tmp4 = mul_mod_p(Y1, &HHH);
+  var Y3 = sub_mod_p(&tmp3, &tmp4);
+  var Z3 = mul_mod_p(Z1, &H);
+  // store back
+  for (var i:u32=0u;i<8u;i++){ (*X1).w[i]=X3.w[i]; (*Y1).w[i]=Y3.w[i]; (*Z1).w[i]=Z3.w[i]; }
+}
+
+const BATCH_WINDOW_SIZE: u32 = 64u;
+
 // ---- Kernel: vanity_kernel_w16_compact ----
 @group(0) @binding(0) var<storage, read> priv_in: array<u32>;
 @group(0) @binding(1) var<storage, read_write> index_compact_out: OutIndices;
@@ -504,21 +568,58 @@ fn vanity_kernel_walk_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var k:u32=0u;k<8u;k++){ x0.w[k]=base_points_in[baseOff + k]; y0.w[k]=base_points_in[baseOff + 8u + k]; z0.w[k]=0u; }
   z0.w[0]=1u;
 
-  // Delta = G affine from precomp constant G_PRECOMP is not present; for now we approximate using adding identity (no-op).
-  // TODO: inject G affine constants; for prototype we'll skip actual point_add and just hash base.
+  // Delta = G affine
+  var gx: U256; var gy: U256; load_G_affine(&gx, &gy);
 
-  // Process steps in windows; prototype: only process the initial base point to validate Keccak + match
-  var xy: array<u32,16>;
-  for (var k:u32=0u;k<8u;k++){ xy[k]=x0.w[k]; xy[8u+k]=y0.w[k]; }
-  // Convert to 64B pub big-endian into 16 LE words
-  var msg: array<u32,16>; var j:u32=0u;
-  for (var t:u32=0u;t<8u;t++){ let w = xy[7u - t]; msg[j]=bswap32(w); j+=1u; }
-  for (var t:u32=0u;t<8u;t++){ let w = xy[15u - t]; msg[j]=bswap32(w); j+=1u; }
-  var digest: array<u32,8>;
-  keccak256_64(&msg, &digest);
-  if (nibble_match(&digest, params_walk.nibble, params_walk.nibbleCount)){
-    let idx = atomicAdd(&out_count_w.value, 1u);
-    if (idx == 0u) { index_compact_out_w.data[0] = i * params_walk.steps; }
+  let steps = params_walk.steps;
+  var processed: u32 = 0u;
+  loop {
+    if (processed >= steps) { break; }
+    let chunk = BATCH_WINDOW_SIZE;
+    // Pre-allocate arrays for batch points
+    var xs: array<U256, BATCH_WINDOW_SIZE>;
+    var ys: array<U256, BATCH_WINDOW_SIZE>;
+    var zs: array<U256, BATCH_WINDOW_SIZE>;
+    // Generate chunk points by repeated addition
+    for (var t:u32=0u; t<chunk; t++){
+      for (var k:u32=0u;k<8u;k++){ xs[t].w[k]=x0.w[k]; ys[t].w[k]=y0.w[k]; zs[t].w[k]=z0.w[k]; }
+      point_add_jacobian_affine(&x0, &y0, &z0, &gx, &gy);
+    }
+    // prefix products of zs to prepare batch inversion
+    var pref: array<U256, BATCH_WINDOW_SIZE>;
+    pref[0] = zs[0];
+    for (var t:u32=1u; t<chunk; t++){
+      pref[t] = mul_mod_p(&pref[t-1u], &zs[t]);
+    }
+    // Invert total
+    var inv_total = inv_mod_p(&pref[chunk - 1u]);
+    // Backward pass
+    for (var rt:i32 = i32(chunk) - 1; rt >= 0; rt--) {
+      var inv_z: U256;
+      if (rt == 0) {
+        inv_z = inv_total;
+      } else {
+        let idx:u32 = u32(rt - 1);
+        inv_z = mul_mod_p(&inv_total, &pref[idx]);
+      }
+      inv_total = mul_mod_p(&inv_total, &zs[u32(rt)]);
+      // affine conversion
+      var z2 = mul_mod_p(&inv_z, &inv_z);
+      var xa = mul_mod_p(&xs[u32(rt)], &z2);
+      var z3 = mul_mod_p(&z2, &inv_z);
+      var ya = mul_mod_p(&ys[u32(rt)], &z3);
+      // pack pub and keccak
+      var msg: array<u32,16>; var j:u32=0u;
+      for (var t:u32=0u;t<8u;t++){ let w = xa.w[7u - t]; msg[j]=bswap32(w); j+=1u; }
+      for (var t:u32=0u;t<8u;t++){ let w = ya.w[7u - t]; msg[j]=bswap32(w); j+=1u; }
+      var digest: array<u32,8>;
+      keccak256_64(&msg, &digest);
+      if (nibble_match(&digest, params_walk.nibble, params_walk.nibbleCount)){
+        atomicAdd(&out_count_w.value, 1u);
+        index_compact_out_w.data[0] = i * params_walk.steps + processed + u32(rt);
+      }
+    }
+    processed += chunk;
   }
 }
 `;

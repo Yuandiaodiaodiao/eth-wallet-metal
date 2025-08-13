@@ -98,27 +98,63 @@ function generateRandomPrivKeys(count) {
   return out;
 }
 
+// secp256k1 order (n)
+const SECP256K1_ORDER = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
+
+function bytesToBigIntBE(bytes) {
+  let result = 0n;
+  for (let i = 0; i < bytes.length; i++) {
+    result = (result << 8n) + BigInt(bytes[i]);
+  }
+  return result;
+}
+
+function bigIntToBytesBE(x, length) {
+  const out = new Uint8Array(length);
+  let v = x;
+  for (let i = length - 1; i >= 0; i--) {
+    out[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return out;
+}
+
+function toHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function runOneBatch() {
   logEl.textContent = '';
   const batchSize = Number.parseInt(ui.batchSize.value, 10) | 0;
   const stepsPerThread = Number.parseInt(ui.stepsPerThread.value, 10) | 0;
-  const nibble = hexToInt(ui.nibble.value);
-  const nibbleCount = Number.parseInt(ui.nibbleCount.value, 10) | 0;
+  const nibble = hexToInt(0);
+  const nibbleCount = 0;
 
   const totalThreads = batchSize;
 
   const { device } = await ensureWebGPU();
   const g16 = await WebGPUVanity.loadG16Buffer(device).catch(() => null);
   const vanity = new WebGPUVanity(device, g16);
-
   // Generate cryptographically strong random private keys
-  const privs = generateRandomPrivKeys(totalThreads);
-
+  const privs = [Uint8Array.from(
+    "0784ee343852383170d8f0bda08afe168e33c284433dad40f2d488acb009297c".match(/.{2}/g).map(b => parseInt(b, 16))
+  )];
+  console.log(privs);
   const t0 = performance.now();
   const { indices, stepsEffective } = await vanity.encodeAndCommitWalkCompact(privs, stepsPerThread, nibble, nibbleCount);
   const t1 = performance.now();
   log(`avg rate: N/A | GPU: ${(t1 - t0).toFixed(2)} ms`);
   if (indices.length) log(`indices: ${JSON.stringify(indices)}`); else log('No match in this batch');
+  const idx = indices[0] >>> 0;
+  const denom = Math.max(1, stepsEffective | 0);
+  const gid = Math.floor(idx / denom);
+  const off = idx % denom;
+  const baseBig = bytesToBigIntBE(privs[gid]);
+  let k = baseBig + BigInt(off);
+  if (k >= SECP256K1_ORDER) k -= SECP256K1_ORDER;
+  if (k === 0n) k = 1n;
+  const kBytes = bigIntToBytesBE(k, 32);
+  log(`私钥1: ${toHex(kBytes)}`);
 }
 
 ui.run.addEventListener('click', () => {
@@ -147,7 +183,8 @@ async function runMultiBatches() {
   for (let b = 1; b <= maxBatches; b++) {
     const t0 = performance.now();
     const privs = generateRandomPrivKeys(totalThreads);
-    const { indices } = await vanity.encodeAndCommitWalkCompact(privs, stepsPerThread, nibble, nibbleCount);
+    console.log(privs);
+    const { indices, stepsEffective } = await vanity.encodeAndCommitWalkCompact(privs, stepsPerThread, nibble, nibbleCount);
     const t1 = performance.now();
     totalKeys += totalThreads * stepsPerThread;
     const elapsed = Math.max((performance.now() - start) / 1000, 1e-6);
@@ -156,6 +193,29 @@ async function runMultiBatches() {
     log(`avg rate: ${avgRate.toFixed(2)} keys/s (${(avgRate/1e6).toFixed(3)} MH/s) | GPU: ${(t1 - t0).toFixed(2)} ms`);
     if (indices.length) {
       log(`indices: ${JSON.stringify(indices)}`);
+      const idx = indices[0] >>> 0;
+      const denom = Math.max(1, stepsEffective | 0);
+      const gid = Math.floor(idx / denom);
+      const off = idx % denom;
+      const baseBig = bytesToBigIntBE(privs[gid]);
+      let k = baseBig + BigInt(off);
+      if (k >= SECP256K1_ORDER) k -= SECP256K1_ORDER;
+      if (k === 0n) k = 1n;
+      const kBytes = bigIntToBytesBE(k, 32);
+      // Verify via walk (1 step) and compact
+      try {
+        const walkVerify = await vanity.encodeAndCommitWalkCompact([kBytes], 1, 0x0, 0);
+        log(`walk indices: ${JSON.stringify(walkVerify.indices)}`);
+      } catch (e) {
+        log(`walk verify error: ${String(e)}`);
+      }
+      try {
+        const compactVerify = await vanity.encodeAndCommitCompact([kBytes], 0x0, 0);
+        log(`compact indices: ${JSON.stringify(compactVerify.indices)}`);
+      } catch (e) {
+        log(`compact verify error: ${String(e)}`);
+      }
+      log(`私钥: ${toHex(kBytes)}`);
       break;
     } else {
       log('No match in this batch');
