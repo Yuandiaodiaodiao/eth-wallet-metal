@@ -380,7 +380,7 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
                     }
                     
                     if (ok){
-                        uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                        atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
                         index_compact_out[0] = gid * steps + processed + (uint)ii;
                     }
                 }

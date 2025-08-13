@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 1024*16*4, nibble: int = 0x6, nibble_count: int = 10, max_batches: Optional[int] = None, steps_per_thread: int = 512*16) -> None:
+def main(batch_size: int = 1024*16, nibble: int = 0x6, nibble_count: int = 9, max_batches: Optional[int] = None, steps_per_thread: int = 512*4) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     engine = MetalVanity(here)
     batches = 0
