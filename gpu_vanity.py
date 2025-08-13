@@ -292,23 +292,23 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
     {
         uint count = params->count; if (gid >= count) return;
         
-        // Load precomputed base point (x0, y0)
+        // Load precomputed base point (x0, y0) and initialize z0 in single loop
         device const u32 *base_point = base_points_in + gid * 16;
-        u32 x0[8]; u32 y0[8];
-        for (ushort i=0;i<8;++i){ x0[i] = base_point[i]; y0[i] = base_point[8+i]; }
-        
+        u32 x0[8]; u32 y0[8]; u32 z0[8];
+        for (ushort i=0;i<8;++i){ 
+            x0[i] = base_point[i]; 
+            y0[i] = base_point[8+i];
+            z0[i] =  0;  // Initialize z0 inline
+        }
+        z0[0]=1;
         // Prepare delta = G (affine)
-        u32 dx[8]; u32 dy[8]; load_G_affine(dx, dy);
+        u32 dx[8]; u32 dy[8]; 
+        load_G_affine(dx, dy);
 
         const uint steps = params->steps;
         uint want = params->nibble & 0xF; 
         uint nibs = params->nibbleCount;
         uchar want_byte = (uchar)((want << 4) | want);
-
-        // Convert to Jacobian for batch processing - use x0/y0 directly  
-        u32 z0[8];
-        for (ushort i=0;i<8;++i){ z0[i]=0; }
-        z0[0]=1;
  // Stack arrays for this batch - fixed size to avoid overflow
         u32 xs[BATCH_WINDOW_SIZE][8];
         u32 ys[BATCH_WINDOW_SIZE][8]; 
