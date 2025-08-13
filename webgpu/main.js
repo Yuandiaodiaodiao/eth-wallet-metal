@@ -135,15 +135,17 @@ async function runOneBatch() {
   const { device } = await ensureWebGPU();
   const g16 = await WebGPUVanity.loadG16Buffer(device).catch(() => null);
   const vanity = new WebGPUVanity(device, g16);
-  // Generate cryptographically strong random private keys
+  // Generate cryptographically strong random private keys (timed)
+  const tGen0 = performance.now();
   const privs = [Uint8Array.from(
     "0784ee343852383170d8f0bda08afe168e33c284433dad40f2d488acb009297c".match(/.{2}/g).map(b => parseInt(b, 16))
   )];
   console.log(privs);
-  const t0 = performance.now();
+  const genMs = performance.now() - tGen0;
+  const tEnc0 = performance.now();
   const { indices, stepsEffective } = await vanity.encodeAndCommitWalkCompact(privs, stepsPerThread, nibble, nibbleCount);
-  const t1 = performance.now();
-  log(`avg rate: N/A | GPU: ${(t1 - t0).toFixed(2)} ms`);
+  const tEnc1 = performance.now();
+  log(`CPU gen: ${genMs.toFixed(2)} ms, GPU: ${(tEnc1 - tEnc0).toFixed(2)} ms`);
   if (indices.length) log(`indices: ${JSON.stringify(indices)}`); else log('No match in this batch');
   const idx = indices[0] >>> 0;
   const denom = Math.max(1, stepsEffective | 0);
@@ -181,16 +183,18 @@ async function runMultiBatches() {
   let totalKeys = 0;
   const start = performance.now();
   for (let b = 1; b <= maxBatches; b++) {
-    const t0 = performance.now();
+    const tGen0 = performance.now();
     const privs = generateRandomPrivKeys(totalThreads);
     console.log(privs);
+    const genMs = performance.now() - tGen0;
+    const tEnc0 = performance.now();
     const { indices, stepsEffective } = await vanity.encodeAndCommitWalkCompact(privs, stepsPerThread, nibble, nibbleCount);
-    const t1 = performance.now();
+    const tEnc1 = performance.now();
     totalKeys += totalThreads * stepsPerThread;
     const elapsed = Math.max((performance.now() - start) / 1000, 1e-6);
     const avgRate = totalKeys / elapsed;
     log(`batch: ${b}`);
-    log(`avg rate: ${avgRate.toFixed(2)} keys/s (${(avgRate/1e6).toFixed(3)} MH/s) | GPU: ${(t1 - t0).toFixed(2)} ms`);
+    log(`avg rate: ${avgRate.toFixed(2)} keys/s (${(avgRate/1e6).toFixed(3)} MH/s) | CPU gen: ${genMs.toFixed(2)} ms, GPU: ${(tEnc1 - tEnc0).toFixed(2)} ms`);
     if (indices.length) {
       log(`indices: ${JSON.stringify(indices)}`);
       const idx = indices[0] >>> 0;

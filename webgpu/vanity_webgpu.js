@@ -108,11 +108,8 @@ export class WebGPUVanity {
 
   // encode_and_commit_walk_compact equivalent (two-stage: compute base, walk)
   async encodeAndCommitWalkCompact(privkeysBE32, stepsPerThread = 8, nibble = 0x8, nibbleCount = 7) {
-    console.log('111')
     await this.ensurePipelines();
-    console.log('encodeAndCommitWalkCompact',privkeysBE32); 
     const count = privkeysBE32.length;
-    const capacity = count * stepsPerThread;
     const inSize = 32 * count;
     const inBuf = this.device.createBuffer({ size: inSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const baseBuf = this.device.createBuffer({ size: count * 16 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });

@@ -475,7 +475,7 @@ fn point_add_jacobian_affine(X1: ptr<function, U256>, Y1: ptr<function, U256>, Z
   for (var i:u32=0u;i<8u;i++){ (*X1).w[i]=X3.w[i]; (*Y1).w[i]=Y3.w[i]; (*Z1).w[i]=Z3.w[i]; }
 }
 
-const BATCH_WINDOW_SIZE: u32 = 64u;
+const BATCH_WINDOW_SIZE: u32 = 128u;
 
 // ---- Kernel: vanity_kernel_w16_compact ----
 @group(0) @binding(0) var<storage, read> priv_in: array<u32>;
@@ -573,20 +573,22 @@ fn vanity_kernel_walk_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let steps = params_walk.steps;
   var processed: u32 = 0u;
+  // Pre-allocate arrays for batch points
+  var xs: array<U256, BATCH_WINDOW_SIZE>;
+  var ys: array<U256, BATCH_WINDOW_SIZE>;
+  var zs: array<U256, BATCH_WINDOW_SIZE>;
+  var pref: array<U256, BATCH_WINDOW_SIZE>;
+
   loop {
     if (processed >= steps) { break; }
     let chunk = BATCH_WINDOW_SIZE;
-    // Pre-allocate arrays for batch points
-    var xs: array<U256, BATCH_WINDOW_SIZE>;
-    var ys: array<U256, BATCH_WINDOW_SIZE>;
-    var zs: array<U256, BATCH_WINDOW_SIZE>;
+   
     // Generate chunk points by repeated addition
     for (var t:u32=0u; t<chunk; t++){
       for (var k:u32=0u;k<8u;k++){ xs[t].w[k]=x0.w[k]; ys[t].w[k]=y0.w[k]; zs[t].w[k]=z0.w[k]; }
       point_add_jacobian_affine(&x0, &y0, &z0, &gx, &gy);
     }
     // prefix products of zs to prepare batch inversion
-    var pref: array<U256, BATCH_WINDOW_SIZE>;
     pref[0] = zs[0];
     for (var t:u32=1u; t<chunk; t++){
       pref[t] = mul_mod_p(&pref[t-1u], &zs[t]);
