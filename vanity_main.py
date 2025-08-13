@@ -2,16 +2,16 @@ import os
 import time
 from typing import Optional
 
-from gpu_vanity import MetalVanity
-from privkey_gen import generate_valid_privkeys, SECP256K1_ORDER_INT
+from vanity.gpu_vanity import MetalVanity
+from vanity.privkey_gen import generate_valid_privkeys, SECP256K1_ORDER_INT
 
 def hex_addr(b: bytes) -> str:
     return "0x" + b.hex()
 
 
 
-def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 11, max_batches: Optional[int] = None, steps_per_thread: int = 256*16) -> None:
-    here = os.path.dirname(os.path.abspath(__file__))
+def main(batch_size: int = 384*8, nibble: int = 0x0, nibble_count: int = 5, max_batches: Optional[int] = None, steps_per_thread: int = 256*16) -> None:
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vanity")
     engine = MetalVanity(here)
     batches = 0
     # Triple-buffering with compact GPU output to maximize GPU utilization
