@@ -304,6 +304,47 @@ __device__ void jacobian_to_affine(uint32_t* x_affine, uint32_t* y_affine,
     mul_mod(y_affine, y, z_inv3);
 }
 
+// Scalar multiplication using double-and-add method
+__device__ void point_mul(uint32_t* x_out, uint32_t* y_out, const uint32_t* k) {
+    uint32_t x[8] = {0}, y[8] = {0}, z[8] = {0};
+    bool first = true;
+    
+    // Double-and-add algorithm
+    for (int bit = 255; bit >= 0; bit--) {
+        int limb_idx = bit >> 5;
+        int bit_idx = bit & 31;
+        
+        if (!first) {
+            point_double(x, y, z, x, y, z);
+        }
+        
+        if ((k[limb_idx] >> bit_idx) & 1) {
+            if (first) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    x[i] = SECP256K1_G[i];
+                    y[i] = SECP256K1_G[8 + i];
+                    z[i] = (i == 0) ? 1 : 0;
+                }
+                first = false;
+            } else {
+                point_add(x, y, z, x, y, z, SECP256K1_G, SECP256K1_G + 8);
+            }
+        }
+    }
+    
+    // Convert to affine
+    if (first) {
+        // Point at infinity
+        for (int i = 0; i < 8; i++) {
+            x_out[i] = 0;
+            y_out[i] = 0;
+        }
+    } else {
+        jacobian_to_affine(x_out, y_out, x, y, z);
+    }
+}
+
 // Scalar multiplication using 16-bit window method with G16 table
 __device__ void point_mul_g16(uint32_t* x_out, uint32_t* y_out,
                               const uint32_t* k, const uint8_t* g16_table) {
@@ -419,7 +460,7 @@ extern "C" __global__ void vanity_kernel_g16(
     
     // Compute public key: (x, y) = k * G
     uint32_t x[8], y[8];
-    point_mul_g16(x, y, k, g16_table);
+    point_mul(x, y, k);
     
     // Convert to bytes (big-endian) for hashing
     uint8_t pubkey[64];

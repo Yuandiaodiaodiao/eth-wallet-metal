@@ -162,7 +162,6 @@ class CudaVanity:
         Returns:
             Tuple of (found_indices, gpu_time_seconds)
         """
-      
         
         num_keys = len(privkeys)
         

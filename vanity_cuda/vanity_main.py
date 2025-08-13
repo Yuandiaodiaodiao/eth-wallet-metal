@@ -203,7 +203,7 @@ def main():
     """Main entry point"""
     # Configuration variables
     pattern = "888"
-    batch_size = 10000
+    batch_size = 1024*16
     steps = 256
     device = 0
     benchmark = False
