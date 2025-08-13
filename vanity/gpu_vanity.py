@@ -133,8 +133,9 @@ inline void keccak256_64(const thread uchar *msg64, thread uchar *out32){
     for (ushort i=0;i<4;++i){ store64_le(A[i], out32 + i*8); }
 }
 
-// params buffer layout
-struct VanityParams { uint count; uint nibble; uint nibbleCount; };
+// params buffer layout (support arbitrary hex prefix pattern)
+// pattern packs two nibbles per byte; if nibbleCount is odd, only the high nibble of pattern[full] is compared
+struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; };
 
 
     // --------------------------
@@ -208,10 +209,11 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
         for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
         uchar digest[32]; keccak256_64(pub, digest);
-        uint want = params->nibble & 0xF; uint nibs = params->nibbleCount; bool ok = true;
-        uchar want_byte = (uchar)((want << 4) | want); uint full = nibs >> 1; uint rem = nibs & 1u;
-        for (uint i = 0; i < full; ++i) { if (digest[12 + i] != want_byte) { ok = false; break; } }
-        if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != want) ok = false; }
+        uint nibs = params->nibbleCount; bool ok = true;
+        uint full = nibs >> 1; uint rem = nibs & 1u;
+        const device uchar *pat = params->pattern;
+        for (uint i = 0; i < full; ++i) { if (digest[12 + i] != pat[i]) { ok = false; break; } }
+        if (ok && rem) { uchar b = digest[12 + full]; if ((b >> 4) != (pat[full] >> 4)) ok = false; }
         if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); index_compact_out[0] = gid; }
     }
 
@@ -248,7 +250,7 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
     // Walker kernels (batched inversion) - generate multiple pubkeys per thread by repeated addition
     // --------------------------
 
-    struct WalkParams { uint count; uint nibble; uint nibbleCount; uint steps; };
+    struct WalkParams { uint count; uint nibbleCount; uint steps; uchar pattern[20]; };
 
     inline void load_G_affine(thread u32 *gx, thread u32 *gy){
         // G_PRECOMP.xy[0..7] = x(G); [8..15] = y(G)
@@ -306,9 +308,8 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         load_G_affine(dx, dy);
 
         const uint steps = params->steps;
-        uint want = params->nibble & 0xF; 
         uint nibs = params->nibbleCount;
-        uchar want_byte = (uchar)((want << 4) | want);
+        const device uchar *pat = params->pattern;
  // Stack arrays for this batch - fixed size to avoid overflow
         u32 xs[BATCH_WINDOW_SIZE][8];
         u32 ys[BATCH_WINDOW_SIZE][8]; 
@@ -373,10 +374,10 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
                     uint full = nibs >> 1; 
                     uint rem = nibs & 1u;
                     for (uint b = 0; b < full; ++b) {
-                     if (digest[12 + b] != want_byte) { ok = false; break; } 
+                        if (digest[12 + b] != pat[b]) { ok = false; break; }
                     }
                     if (ok && rem) { 
-                    if ((digest[12 + full] >> 4) != want) ok = false; 
+                        if ((digest[12 + full] >> 4) != (pat[full] >> 4)) ok = false; 
                     }
                     
                     if (ok){
@@ -456,7 +457,38 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
             self.gpu_start_time: float = -1.0
             self.gpu_end_time: float = -1.0
 
-    def encode_and_commit_compact(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
+    def _pack_prefix_pattern(self, nibble: int, nibble_count: int, prefix_hex: Optional[str]) -> Tuple[bytes, int]:
+        # Returns (20-byte pattern, nibble_count)
+        if prefix_hex is not None and len(prefix_hex) > 0:
+            s = prefix_hex.lower().strip()
+            if s.startswith("0x"):
+                s = s[2:]
+            # keep only hex digits
+            for c in s:
+                if c not in "0123456789abcdef":
+                    raise ValueError("prefix_hex must be hex characters 0-9a-f")
+            nibs = min(len(s), 40)
+            # convert to nibbles
+            nibbles: List[int] = [int(ch, 16) for ch in s[:nibs]]
+        else:
+            # legacy repeated nibble
+            want = int(nibble) & 0xF
+            nibs = max(0, int(nibble_count))
+            nibbles = [want] * min(nibs, 40)
+        # pack two nibbles per byte
+        full = nibs // 2
+        rem = nibs & 1
+        pat = bytearray(20)
+        for i in range(full):
+            hi = nibbles[2*i]
+            lo = nibbles[2*i + 1]
+            pat[i] = ((hi & 0xF) << 4) | (lo & 0xF)
+        if rem:
+            hi = nibbles[2*full]
+            pat[full] = ((hi & 0xF) << 4)
+        return (bytes(pat), nibs)
+
+    def encode_and_commit_compact(self, privkeys_be32: List[bytes], nibble: int = 0x8, nibble_count: int = 7, prefix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
         if not privkeys_be32:
             raise ValueError("privkeys_be32 must not be empty")
         for i, k in enumerate(privkeys_be32):
@@ -481,11 +513,12 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         # Zero out_count
         out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
 
-        # params
-        p = bytearray(12)
+        # params: VanityParams {count, nibbleCount, pattern[20]}
+        pattern, nibs = self._pack_prefix_pattern(nibble, nibble_count, prefix_hex)
+        p = bytearray(28)
         p[0:4] = int(count).to_bytes(4, "little")
-        p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
-        p[8:12] = int(nibble_count).to_bytes(4, "little")
+        p[4:8] = int(nibs).to_bytes(4, "little")
+        p[8:28] = pattern
 
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
@@ -497,10 +530,10 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
         try:
-            enc.setBytes_length_atIndex_(bytes(p), 12, 3)
+            enc.setBytes_length_atIndex_(bytes(p), 28, 3)
         except Exception:
-            params_buffer = self.device.newBufferWithLength_options_(12, 0)
-            params_buffer.contents().as_buffer(12)[:12] = bytes(p)
+            params_buffer = self.device.newBufferWithLength_options_(28, 0)
+            params_buffer.contents().as_buffer(28)[:28] = bytes(p)
             enc.setBuffer_offset_atIndex_(params_buffer, 0, 3)
         if use_w16:
             enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 4)
@@ -587,7 +620,7 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         return job._indices or [], job.effective_steps_per_thread
 
 
-    def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, nibble: int = 0x8, nibble_count: int = 7) -> "MetalVanity.VanityJobCompact":
+    def encode_and_commit_walk_compact(self, privkeys_be32: List[bytes], steps_per_thread: int = 8, nibble: int = 0x8, nibble_count: int = 7, prefix_hex: Optional[str] = None) -> "MetalVanity.VanityJobCompact":
         if not privkeys_be32:
             raise ValueError("privkeys_be32 must not be empty")
         if steps_per_thread <= 0:
@@ -617,12 +650,13 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         # Zero out_count
         out_count_buffer.contents().as_buffer(4)[:4] = (0).to_bytes(4, "little")
 
-        # params: WalkParams {count, nibble, nibbleCount, steps}
-        p = bytearray(16)
+        # params: WalkParams {count, nibbleCount, steps, pattern[20]}
+        pattern, nibs = self._pack_prefix_pattern(nibble, nibble_count, prefix_hex)
+        p = bytearray(28)
         p[0:4] = int(count).to_bytes(4, "little")
-        p[4:8] = int(nibble & 0xF).to_bytes(4, "little")
-        p[8:12] = int(nibble_count).to_bytes(4, "little")
-        p[12:16] = int(steps_per_thread).to_bytes(4, "little")
+        p[4:8] = int(nibs).to_bytes(4, "little")
+        p[8:12] = int(steps_per_thread).to_bytes(4, "little")
+        p[12:32] = pattern
 
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
@@ -640,10 +674,10 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         enc1.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc1.setBuffer_offset_atIndex_(base_points_buffer, 0, 1)
         try:
-            enc1.setBytes_length_atIndex_(bytes(p), 16, 2)
+            enc1.setBytes_length_atIndex_(bytes(p), 28, 2)
         except Exception:
-            params_buffer = self.device.newBufferWithLength_options_(16, 0)
-            params_buffer.contents().as_buffer(16)[:16] = bytes(p)
+            params_buffer = self.device.newBufferWithLength_options_(28, 0)
+            params_buffer.contents().as_buffer(28)[:28] = bytes(p)
             enc1.setBuffer_offset_atIndex_(params_buffer, 0, 2)
         # Pass g16_table buffer if using w16 version
         if use_w16_compute:
@@ -667,11 +701,11 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         enc2.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
         enc2.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         try:
-            enc2.setBytes_length_atIndex_(bytes(p), 16, 3)
+            enc2.setBytes_length_atIndex_(bytes(p), 28, 3)
         except Exception:
             if 'params_buffer' not in locals():
-                params_buffer = self.device.newBufferWithLength_options_(16, 0)
-                params_buffer.contents().as_buffer(16)[:16] = bytes(p)
+                params_buffer = self.device.newBufferWithLength_options_(28, 0)
+                params_buffer.contents().as_buffer(28)[:28] = bytes(p)
             enc2.setBuffer_offset_atIndex_(params_buffer, 0, 3)
         print(f'walk_pipeline thread_execution_width: {walk_pipeline.threadExecutionWidth()}')
         max_threads = int(walk_pipeline.maxTotalThreadsPerThreadgroup())
