@@ -49,7 +49,7 @@ class MetalVanity:
 #endif
 
 // Fixed window size for sliding batch processing to avoid stack overflow
-#define BATCH_WINDOW_SIZE 256
+#define BATCH_WINDOW_SIZE 512
 
 // Precomputed basepoint table in constant memory to be shared across all threads
 constant secp256k1_t G_PRECOMP = { {
@@ -654,7 +654,7 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         max_threads = int(active_compute_pipeline.maxTotalThreadsPerThreadgroup())
         print(f'compute_base_pipeline max_threads: {max_threads}')
 
-        tpt = 8
+        tpt = 16
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(count, 1, 1)
         enc1.dispatchThreads_threadsPerThreadgroup_(grid, tg)
@@ -676,7 +676,7 @@ struct VanityParams { uint count; uint nibble; uint nibbleCount; };
         print(f'walk_pipeline thread_execution_width: {walk_pipeline.threadExecutionWidth()}')
         max_threads = int(walk_pipeline.maxTotalThreadsPerThreadgroup())
         print(f'walk_pipeline max_threads: {max_threads}')
-        tpt = 64
+        tpt = 128
         print(f'tpt: {tpt}')
         tg = MTLSizeMake(tpt, 1, 1)
         grid = MTLSizeMake(count, 1, 1)
