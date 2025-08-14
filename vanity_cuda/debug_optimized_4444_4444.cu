@@ -152,11 +152,17 @@ extern "C" __global__ void vanity_walker_kernel(
     uint32_t* __restrict__ found_indices,      // Output indices
     uint32_t* __restrict__ found_count,        // Output count
     uint32_t num_keys,
+    #ifdef USE_PATTERN_OPTIMIZATION
+    uint32_t steps_per_thread
+
+    #else
     uint32_t steps_per_thread,
     const uint8_t* __restrict__ head_pattern,  // Head pattern (packed nibbles as bytes)
     uint32_t head_nibbles,                     // Number of head nibbles to match
     const uint8_t* __restrict__ tail_pattern,  // Tail pattern (packed nibbles as bytes)
-    uint32_t tail_nibbles)                     // Number of tail nibbles to match
+    uint32_t tail_nibbles             // Number of tail nibbles to match
+    #endif
+)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= num_keys) return;

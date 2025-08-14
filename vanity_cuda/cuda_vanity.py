@@ -536,10 +536,6 @@ class CudaVanity:
                 d_found_count.data.ptr,     # found_count
                 cp.uint32(num_keys),        # num_keys
                 cp.uint32(steps_per_thread), # steps_per_thread
-                0,                          # head_pattern not needed (NULL pointer)
-                cp.uint32(0),               # head_nibbles not needed
-                0,                          # tail_pattern not needed (NULL pointer)
-                cp.uint32(0)                # tail_nibbles not needed
             )
         else:
             # Standard kernel with pattern parameters
