@@ -3,6 +3,17 @@
 Main entry point for CUDA-based Ethereum vanity address generator
 Compatible with the existing vanity address generation workflow
 """
+try:
+    from ecdsa import SECP256k1  # type: ignore
+    SECP256K1_ORDER_BYTES = SECP256k1.order.to_bytes(32, "big")
+except Exception:  # Fallback if ecdsa not importable at import-time
+    SECP256K1_ORDER_BYTES = int(
+        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    ).to_bytes(32, "big")
+
+
+# Integer curve order for fast modular arithmetic
+SECP256K1_ORDER_INT = int.from_bytes(SECP256K1_ORDER_BYTES, "big")
 
 import os
 import sys
@@ -102,16 +113,24 @@ class VanityAddressGenerator:
         
         # Extract matching private keys
         for idx in indices:
+
             if use_walker:
                 key_idx = idx // steps_per_thread
                 step = idx % steps_per_thread
             else:
                 key_idx = idx
                 step = 0
-            
+
             if key_idx < len(privkeys):
+                base = int.from_bytes(privkeys[key_idx], "big")
+                k = base + step
+                n = SECP256K1_ORDER_INT
+                if k >= n:
+                    k -= n
+                if k == 0:
+                    k = 1
                 # Calculate actual private key (base_key + step * G)
-                base_key = privkeys[key_idx]
+                base_key = k.to_bytes(32, "big")
                 # For simplicity, we store the base key and step
                 # In production, you'd compute the actual private key
                 results["matches"].append({
@@ -221,7 +240,7 @@ def main():
     # Configuration variables
     pattern = "8888"
     batch_size = 4096
-    steps = 1
+    steps = 512
     device = 0
     benchmark = False
     useWalker = True
