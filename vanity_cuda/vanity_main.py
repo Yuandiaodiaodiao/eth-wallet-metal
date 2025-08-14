@@ -330,7 +330,7 @@ class VanityAddressGenerator:
                 # Run GPU kernel
                 middle_gpu_time = 0
                 if useWalker:
-                    indices, gpu_time, middle_gpu_time = self.cuda_generator.generate_vanity_walker(
+                    indices, gpu_time,middle_gpu_time = self.cuda_generator.generate_vanity_walker(
                         privkeys,
                         steps_per_thread=steps_per_thread,
                         head_pattern=head_pattern,
@@ -496,39 +496,31 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "4444,4444"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
+    pattern = "000000,000000"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
     batch_size = 4096*32
     steps = 512*8
     device = 0
-    benchmark = False
     useWalker = True
     use_parallel = True  # Use parallel CPU-GPU processing
     # Initialize generator
     generator = VanityAddressGenerator(device_id=device)
     
-    if benchmark:
-        # Run benchmark
-        print("Running benchmark...")
-        generator.cuda_generator.benchmark(
-            num_keys=batch_size,
-            steps_per_thread=steps
+    
+    # Run continuous generation
+    if use_parallel:
+        generator.run_continuous_parallel(
+            target_pattern=pattern,
+            batch_size=batch_size,
+            steps_per_thread=steps,
+            useWalker=useWalker
         )
     else:
-        # Run continuous generation
-        if use_parallel:
-            generator.run_continuous_parallel(
-                target_pattern=pattern,
-                batch_size=batch_size,
-                steps_per_thread=steps,
-                useWalker=useWalker
-            )
-        else:
-            generator.run_continuous(
-                target_pattern=pattern,
-                batch_size=batch_size,
-                steps_per_thread=steps,
-                useWalker=useWalker
-            )
+        generator.run_continuous(
+            target_pattern=pattern,
+            batch_size=batch_size,
+            steps_per_thread=steps,
+            useWalker=useWalker
+        )
 
 
 if __name__ == "__main__":

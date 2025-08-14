@@ -4,7 +4,8 @@
       "Bash(python -m pip:*)",
       "Bash(nvcc:*)",
       "Bash(echo $CUDA_PATH)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(/c/Users/Yuan/miniconda3/python -m vanity_cuda.cuda_vanity)"
     ],
     "deny": [],
     "ask": []
