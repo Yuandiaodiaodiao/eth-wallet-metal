@@ -6,7 +6,7 @@
 #include "include/keccak256.cuh"
 
 // Batch size for walker kernel (matches Metal implementation)
-#define BATCH_WINDOW_SIZE 1
+#define BATCH_WINDOW_SIZE 512
 
 // ======================
 // CUDA Kernel Functions

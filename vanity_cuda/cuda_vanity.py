@@ -250,7 +250,7 @@ class CudaVanity:
         start_time = time.perf_counter()
         
         # Stage 1: Compute base points
-        block_size = 16
+        block_size = 64
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print('launch compute base')
@@ -263,11 +263,12 @@ class CudaVanity:
             self.g16_table.data.ptr,    # g16_table
             cp.uint32(num_keys)         # num_keys
         )
-        
         print('launch walker')
+        middle_gpu_time = time.perf_counter() - start_time
+
         # Stage 2: Walker kernel
         # Use smaller block size for walker due to higher register usage
-        block_size = 64
+        block_size = 32
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print(f'launch walker {grid_size} {block_size}')
@@ -293,7 +294,7 @@ class CudaVanity:
         found_count = int(d_found_count.get()[0])
         found_indices = d_found_indices[:found_count].get().tolist() if found_count > 0 else []
         
-        return found_indices, gpu_time
+        return found_indices, gpu_time , middle_gpu_time
     
     def benchmark(self, num_keys: int = 10000, steps_per_thread: int = 256):
         """Run a benchmark test"""

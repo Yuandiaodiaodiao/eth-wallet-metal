@@ -26,7 +26,7 @@ from typing import List, Dict, Any, Optional
 sys.path.append(str(Path(__file__).parent.parent))
 
 from vanity_cuda.cuda_vanity import CudaVanity
-from vanity.privkey_gen import generate_private_keys
+from vanity.privkey_gen import generate_valid_privkeys
 
 class VanityAddressGenerator:
     """High-level interface for vanity address generation"""
@@ -68,15 +68,15 @@ class VanityAddressGenerator:
         
         # Generate private keys
         print(f"Generating {batch_size} private keys...")
-        privkeys = generate_private_keys(batch_size)
+        privkeys = generate_valid_privkeys(batch_size,steps_per_thread,128)
         # privkeys = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
         # for i in range(len(privkeys)):
         #     print(f"privkeys[{i}] = {privkeys[i].hex()}")
         # Run GPU kernel
-        
+        middle_gpu_time=0
         if use_walker:
             print('use worker')
-            indices, gpu_time = self.cuda_generator.generate_vanity_walker(
+            indices, gpu_time, middle_gpu_time = self.cuda_generator.generate_vanity_walker(
                 privkeys,
                 steps_per_thread=steps_per_thread,
                 target_nibble=target_nibble,
@@ -107,6 +107,7 @@ class VanityAddressGenerator:
                 "addresses_checked": addresses_checked,
                 "matches_found": len(indices),
                 "gpu_time": gpu_time,
+                "middle_gpu_time": middle_gpu_time,
                 "throughput": addresses_checked / gpu_time / 1e6  # MAddr/s
             }
         }
@@ -196,7 +197,9 @@ class VanityAddressGenerator:
                       f"Found {len(results['matches'])} matches, "
                       f"Total: {self.stats['total_matches_found']}, "
                       f"Throughput: {results['batch_stats']['throughput']:.2f} MAddr/s, "
-                      f"Avg: {avg_throughput:.2f} MAddr/s")
+                      f"Avg: {avg_throughput:.2f} MAddr/s, "
+                      f"GPU Time: {results['batch_stats']['gpu_time']:.2f} seconds, "
+                      f"Middle GPU Time: {results['batch_stats']['middle_gpu_time']:.2f} seconds")
                 
 
                 # Save results periodically
@@ -238,9 +241,9 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "8888"
-    batch_size = 4096
-    steps = 512
+    pattern = "8888888"
+    batch_size = 4096*32
+    steps = 512*8
     device = 0
     benchmark = False
     useWalker = True
