@@ -52,6 +52,12 @@ class CudaVanity:
         # Thread pool for async operations
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
+        # Pattern-optimized kernel cache
+        self.pattern_kernel_cache = {}
+        
+        # Kernel source for pattern-optimized compilation
+        self.base_kernel_source = None
+        
         # Get device properties
         self.compute_capability = self.device.compute_capability
         self.arch = "".join(f"{i}" for i in self.compute_capability)
@@ -78,7 +84,8 @@ class CudaVanity:
         with open(kernel_dir / "kernels.cu", "r") as f:
             kernel_source = f.read()
         
-
+        # Store base kernel source for pattern-optimized compilation
+        self.base_kernel_source = kernel_source
         
         # Combine sources (headers are included via #include in kernels.cu)
         # For cuda.core, we need to provide the full source with includes resolved
@@ -172,6 +179,152 @@ class CudaVanity:
         # Wait for completion
         self.stream_g16.sync()
         return g16_table
+    
+    def _generate_pattern_macros(self, head_pattern: str, tail_pattern: str) -> str:
+        """Generate compile-time macros for pattern matching"""
+        macros = []
+        
+        if head_pattern:
+            # Generate head pattern macro
+            checks = []
+            for i in range(0, len(head_pattern), 2):
+                byte_idx = i // 2
+                if i + 1 < len(head_pattern):
+                    # Complete byte
+                    byte_val = (int(head_pattern[i], 16) << 4) | int(head_pattern[i+1], 16)
+                    checks.append(f"(addr[{byte_idx}] == 0x{byte_val:02x})")
+                else:
+                    # Half byte (only upper nibble)
+                    nibble = int(head_pattern[i], 16)
+                    checks.append(f"((addr[{byte_idx}] >> 4) == 0x{nibble:x})")
+            
+            macro = f"#define CHECK_HEAD_PATTERN(addr) ({' && '.join(checks)})"
+            macros.append(macro)
+        else:
+            macros.append("#define CHECK_HEAD_PATTERN(addr) (true)")
+        
+        if tail_pattern:
+            # Generate tail pattern macro
+            checks = []
+            pattern_len = len(tail_pattern)
+            full_bytes = pattern_len // 2
+            has_half = pattern_len % 2
+            
+            # Check from the end of address (byte 19, 18, 17, ...)
+            if has_half:
+                # Last nibble (rightmost)
+                nibble = int(tail_pattern[-1], 16)
+                checks.append(f"((addr[19] & 0xF) == 0x{nibble:x})")
+                remaining_pattern = tail_pattern[:-1]
+            else:
+                remaining_pattern = tail_pattern
+            
+            # Check full bytes from right to left
+            byte_pos = 19 - (1 if has_half else 0)
+            for i in range(0, len(remaining_pattern), 2):
+                if i + 1 < len(remaining_pattern):
+                    # Two nibbles forming a complete byte
+                    high_nibble = int(remaining_pattern[-(i+2)], 16)  # Read from end
+                    low_nibble = int(remaining_pattern[-(i+1)], 16)
+                    byte_val = (high_nibble << 4) | low_nibble
+                    checks.append(f"(addr[{byte_pos}] == 0x{byte_val:02x})")
+                    byte_pos -= 1
+            
+            macro = f"#define CHECK_TAIL_PATTERN(addr) ({' && '.join(checks)})"
+            macros.append(macro)
+        else:
+            macros.append("#define CHECK_TAIL_PATTERN(addr) (true)")
+        
+        return '\n'.join(macros)
+    
+    def _get_pattern_kernel(self, head_pattern: str, tail_pattern: str):
+        """Get or compile pattern-optimized kernel"""
+        pattern_key = (head_pattern, tail_pattern)
+        
+        # Check cache
+        if pattern_key in self.pattern_kernel_cache:
+            return self.pattern_kernel_cache[pattern_key]
+        
+        # Generate pattern-specific macros
+        pattern_macros = self._generate_pattern_macros(head_pattern, tail_pattern)
+        
+        # Create modified kernel source with pattern macros
+        # Insert macros before the includes
+        lines = self.base_kernel_source.split('\n')
+        
+        # Find the position after includes but before kernel definitions
+        insert_pos = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#include'):
+                insert_pos = i + 1
+            elif line.strip().startswith('//') and 'CUDA Kernel Functions' in line:
+                break
+        
+        # Insert our optimization macros after includes
+        optimized_lines = (
+            lines[:insert_pos] + 
+            ['', '// Pattern optimization macros'] +
+            pattern_macros.split('\n') +
+            ['#define USE_PATTERN_OPTIMIZATION', '', 
+             '// Ultra-fast pattern check with compile-time patterns',
+             '__device__ __forceinline__ bool check_vanity_pattern_optimized(const uint8_t* addr20) {',
+             '    return CHECK_HEAD_PATTERN(addr20) && CHECK_TAIL_PATTERN(addr20);',
+             '}', ''] +
+            lines[insert_pos:]
+        )
+        
+        optimized_source = '\n'.join(optimized_lines)
+        
+        # Compile options
+        kernel_dir = Path(__file__).parent
+        cuda_include_path = os.path.join(os.environ.get("CUDA_PATH", ""), "include")
+        include_paths = [str(kernel_dir)]
+        if os.path.exists(cuda_include_path):
+            include_paths.append(cuda_include_path)
+        
+        program_options = ProgramOptions(
+            arch=f"sm_{self.arch}",
+            include_path=include_paths,
+            use_fast_math=True
+        )
+        
+        # Create and compile program
+        program = Program(optimized_source, code_type="c++", options=program_options)
+        
+        kernel_names = [
+            "vanity_kernel_g16",
+            "compute_basepoints_g16", 
+            "vanity_walker_kernel",
+            "build_g16_table_kernel"
+        ]
+        
+        module = program.compile("cubin", name_expressions=kernel_names)
+        
+        # Get optimized kernel references
+        optimized_kernels = {
+            'vanity_g16': module.get_kernel("vanity_kernel_g16"),
+            'compute_base': module.get_kernel("compute_basepoints_g16"),
+            'walker': module.get_kernel("vanity_walker_kernel"),
+            'build_g16': module.get_kernel("build_g16_table_kernel")
+        }
+        
+        # Cache the compiled kernels
+        self.pattern_kernel_cache[pattern_key] = optimized_kernels
+        
+        print(f"Compiled optimized kernel for pattern: head='{head_pattern}', tail='{tail_pattern}'")
+        
+        # Debug: print generated macros
+        print("Generated macros:")
+        for line in pattern_macros.split('\n'):
+            print(f"  {line}")
+        
+        # Debug: save optimized source to file for inspection
+        debug_path = kernel_dir / f"debug_optimized_{head_pattern}_{tail_pattern}.cu"
+        with open(debug_path, "w") as f:
+            f.write(optimized_source)
+        print(f"Debug: Saved optimized source to {debug_path}")
+        
+        return optimized_kernels
     
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
@@ -290,6 +443,17 @@ class CudaVanity:
              
         num_keys = len(privkeys)
         
+        # Get pattern-optimized kernels
+        if head_pattern or tail_pattern:
+            optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+            kernel_compute_base = optimized_kernels['compute_base']
+            kernel_walker = optimized_kernels['walker']
+            print(f"Using optimized kernel for head='{head_pattern}', tail='{tail_pattern}'")
+        else:
+            # Use default kernels for no pattern
+            kernel_compute_base = self.kernel_compute_base
+            kernel_walker = self.kernel_walker
+        
         # Convert pattern strings to byte arrays
         def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
             if not pattern:
@@ -345,7 +509,7 @@ class CudaVanity:
         launch(
             self.stream,
             config,
-            self.kernel_compute_base,
+            kernel_compute_base,
             d_privkeys.data.ptr,        # privkeys
             d_basepoints.data.ptr,      # basepoints
             self.g16_table.data.ptr,    # g16_table
@@ -360,20 +524,39 @@ class CudaVanity:
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print(f'launch walker {grid_size} {block_size}')
-        launch(
-            self.stream,
-            config,
-            self.kernel_walker,
-            d_basepoints.data.ptr,      # basepoints
-            d_found_indices.data.ptr,   # found_indices
-            d_found_count.data.ptr,     # found_count
-            cp.uint32(num_keys),        # num_keys
-            cp.uint32(steps_per_thread), # steps_per_thread
-            d_head_pattern.data.ptr,    # head_pattern
-            cp.uint32(head_nibbles),    # head_nibbles
-            d_tail_pattern.data.ptr,    # tail_pattern
-            cp.uint32(tail_nibbles)     # tail_nibbles
-        )
+        # Use optimized kernel without pattern parameters if optimization is enabled
+        if head_pattern or tail_pattern:
+            # Optimized kernel doesn't need pattern parameters
+            launch(
+                self.stream,
+                config,
+                kernel_walker,
+                d_basepoints.data.ptr,      # basepoints
+                d_found_indices.data.ptr,   # found_indices
+                d_found_count.data.ptr,     # found_count
+                cp.uint32(num_keys),        # num_keys
+                cp.uint32(steps_per_thread), # steps_per_thread
+                0,                          # head_pattern not needed (NULL pointer)
+                cp.uint32(0),               # head_nibbles not needed
+                0,                          # tail_pattern not needed (NULL pointer)
+                cp.uint32(0)                # tail_nibbles not needed
+            )
+        else:
+            # Standard kernel with pattern parameters
+            launch(
+                self.stream,
+                config,
+                kernel_walker,
+                d_basepoints.data.ptr,      # basepoints
+                d_found_indices.data.ptr,   # found_indices
+                d_found_count.data.ptr,     # found_count
+                cp.uint32(num_keys),        # num_keys
+                cp.uint32(steps_per_thread), # steps_per_thread
+                d_head_pattern.data.ptr,    # head_pattern
+                cp.uint32(head_nibbles),    # head_nibbles
+                d_tail_pattern.data.ptr,    # tail_pattern
+                cp.uint32(tail_nibbles)     # tail_nibbles
+            )
         print('sync')
         # Wait for completion
         self.stream.sync()
@@ -404,8 +587,20 @@ class CudaVanity:
             AsyncGpuResult with future for getting results
         """
         
-        print(f"Starting async generation of {len(privkeys)} private keys...")
+        print(f"Starting async generation of {len(privkeys)} private keys with optimized patterns...")
         num_keys = len(privkeys)
+        
+        # Get pattern-optimized kernels
+        if head_pattern or tail_pattern:
+            optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+            kernel_compute_base = optimized_kernels['compute_base']
+            kernel_walker = optimized_kernels['walker']
+            print(f"Using optimized kernel for head='{head_pattern}', tail='{tail_pattern}'")
+        else:
+            # Use default kernels for no pattern
+            kernel_compute_base = self.kernel_compute_base
+            kernel_walker = self.kernel_walker
+            print("Using default kernels (no pattern optimization)")
         
         # Convert pattern strings to byte arrays (same as sync version)
         def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
@@ -462,7 +657,7 @@ class CudaVanity:
             launch(
                 self.stream_compute,
                 config,
-                self.kernel_compute_base,
+                kernel_compute_base,
                 d_privkeys.data.ptr,
                 d_basepoints.data.ptr,
                 self.g16_table.data.ptr,
@@ -480,20 +675,39 @@ class CudaVanity:
             grid_size = (num_keys + block_size - 1) // block_size
             config = LaunchConfig(grid=grid_size, block=block_size)
             
-            launch(
-                self.stream_compute,
-                config,
-                self.kernel_walker,
-                d_basepoints.data.ptr,
-                d_found_indices.data.ptr,
-                d_found_count.data.ptr,
-                cp.uint32(num_keys),
-                cp.uint32(steps_per_thread),
-                d_head_pattern.data.ptr,
-                cp.uint32(head_nibbles),
-                d_tail_pattern.data.ptr,
-                cp.uint32(tail_nibbles)
-            )
+            # Use optimized kernel without pattern parameters if optimization is enabled
+            if head_pattern or tail_pattern:
+                # Optimized kernel doesn't need pattern parameters
+                launch(
+                    self.stream_compute,
+                    config,
+                    kernel_walker,
+                    d_basepoints.data.ptr,
+                    d_found_indices.data.ptr,
+                    d_found_count.data.ptr,
+                    cp.uint32(num_keys),
+                    cp.uint32(steps_per_thread),
+                    0,           # head_pattern not needed (NULL pointer)
+                    cp.uint32(0),  # head_nibbles not needed
+                    0,           # tail_pattern not needed (NULL pointer)
+                    cp.uint32(0)   # tail_nibbles not needed
+                )
+            else:
+                # Standard kernel with pattern parameters
+                launch(
+                    self.stream_compute,
+                    config,
+                    kernel_walker,
+                    d_basepoints.data.ptr,
+                    d_found_indices.data.ptr,
+                    d_found_count.data.ptr,
+                    cp.uint32(num_keys),
+                    cp.uint32(steps_per_thread),
+                    d_head_pattern.data.ptr,
+                    cp.uint32(head_nibbles),
+                    d_tail_pattern.data.ptr,
+                    cp.uint32(tail_nibbles)
+                )
             
             # Record end
             end_event.record(self.stream_compute)

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -m pip:*)",
       "Bash(nvcc:*)",
-      "Bash(echo $CUDA_PATH)"
+      "Bash(echo $CUDA_PATH)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []
