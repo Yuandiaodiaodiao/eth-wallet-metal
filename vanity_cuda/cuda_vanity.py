@@ -150,7 +150,7 @@ class CudaVanity:
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
                               target_nibble: int = 0x8,
-                              nibble_count: int = 7) -> Tuple[List[int], float]:
+                              nibble_count: int = 7) -> Tuple[List[int], float, bytes]:
         """
         Generate vanity addresses using simple kernel (one address per thread)
         
@@ -160,7 +160,7 @@ class CudaVanity:
             nibble_count: Number of nibbles to match
             
         Returns:
-            Tuple of (found_indices, gpu_time_seconds)
+            Tuple of (found_indices, gpu_time_seconds, addresses_bytes)
         """
         
         num_keys = len(privkeys)
@@ -173,6 +173,7 @@ class CudaVanity:
         max_found = min(1, num_keys)  # Limit output size
         d_found_indices = cp.zeros(max_found, dtype=cp.uint32)
         d_found_count = cp.zeros(1, dtype=cp.uint32)
+        d_outbuffer = cp.zeros(num_keys * 20, dtype=cp.uint8)  # 20 bytes per address
         
         # Configure kernel launch
         block_size = 256
@@ -191,6 +192,7 @@ class CudaVanity:
             d_privkeys.data.ptr,        # privkeys
             d_found_indices.data.ptr,   # found_indices
             d_found_count.data.ptr,     # found_count
+            d_outbuffer.data.ptr,       # outbuffer
             self.g16_table.data.ptr,    # g16_table
             cp.uint32(num_keys),        # num_keys
             cp.uint8(target_nibble),    # target_nibble
@@ -204,8 +206,9 @@ class CudaVanity:
         # Get results
         found_count = int(d_found_count.get()[0])
         found_indices = d_found_indices[:found_count].get().tolist() if found_count > 0 else []
+        addresses = d_outbuffer.get()  # Get all addresses
         
-        return found_indices, gpu_time
+        return found_indices, gpu_time, addresses
     
     def generate_vanity_walker(self,
                                privkeys: List[bytes],

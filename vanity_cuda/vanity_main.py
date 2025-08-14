@@ -58,6 +58,7 @@ class VanityAddressGenerator:
         # Generate private keys
         print(f"Generating {batch_size} private keys...")
         privkeys = generate_private_keys(batch_size)
+        privkeys = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
         # for i in range(len(privkeys)):
         #     print(f"privkeys[{i}] = {privkeys[i].hex()}")
         # Run GPU kernel
@@ -70,8 +71,9 @@ class VanityAddressGenerator:
                 nibble_count=nibble_count
             )
             addresses_checked = batch_size * steps_per_thread
+            all_addresses = None  # Walker kernel doesn't support address output yet
         else:
-            indices, gpu_time = self.cuda_generator.generate_vanity_simple(
+            indices, gpu_time, all_addresses = self.cuda_generator.generate_vanity_simple(
                 privkeys,
                 target_nibble=target_nibble,
                 nibble_count=nibble_count
@@ -87,6 +89,7 @@ class VanityAddressGenerator:
         # Process results
         results = {
             "matches": [],
+            "all_addresses": all_addresses,
             "batch_stats": {
                 "keys_processed": batch_size,
                 "addresses_checked": addresses_checked,
@@ -116,6 +119,16 @@ class VanityAddressGenerator:
                     "step": step,
                     "pattern": f"0x{target_pattern}"
                 })
+        
+        # Print addresses only when not using walker mode
+        if not use_walker and all_addresses is not None:
+            print(f"\nAddresses from batch:")
+            for i in range(min(10, batch_size)):  # Show first 10 addresses
+                addr_bytes = all_addresses[i*20:(i+1)*20]
+                addr_hex = "0x" + addr_bytes.tobytes().hex()
+                privkey_hex = privkeys[i].hex()
+                print(f"  privkey[{i}]: {privkey_hex}")
+                print(f"  address[{i}]: {addr_hex}")
         
         return results
     
@@ -164,6 +177,7 @@ class VanityAddressGenerator:
                       f"Throughput: {results['batch_stats']['throughput']:.2f} MAddr/s, "
                       f"Avg: {avg_throughput:.2f} MAddr/s")
                 
+
                 # Save results periodically
                 if len(all_matches) > 0:
                     print(f"ans = {all_matches[0]}")
@@ -203,8 +217,8 @@ def main():
     """Main entry point"""
     # Configuration variables
     pattern = "888"
-    batch_size = 1024*16
-    steps = 256
+    batch_size = 1
+    steps = 1
     device = 0
     benchmark = False
     useWalker = False
