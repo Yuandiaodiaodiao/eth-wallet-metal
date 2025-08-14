@@ -10,4 +10,7 @@ numpy>=1.24.0
 # Cryptography library for secp256k1
 ecdsa
 
+# CUDA core library
+cuda-core[cu12]
+
 
