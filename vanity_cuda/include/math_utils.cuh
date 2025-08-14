@@ -27,6 +27,7 @@ __device__ __forceinline__ uint32_t add(uint32_t* r, const uint32_t* a, const ui
     );
     #else
     // Fallback for older architectures
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         uint64_t sum = (uint64_t)a[i] + b[i] + carry;
         r[i] = (uint32_t)sum;
@@ -62,6 +63,7 @@ __device__ __forceinline__ uint32_t sub(uint32_t* r, const uint32_t* a, const ui
     );
     #else
     // Fallback for older architectures
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         uint32_t diff = a[i] - b[i] - borrow;
         borrow = (diff > a[i]) ? 1 : borrow;
@@ -87,9 +89,11 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     uint32_t t0 = 0;
     uint32_t t1 = 0;
     uint32_t c = 0;
-    
+
+    #pragma unroll
     for (uint32_t i = 0; i < 8; i++)
     {
+        #pragma unroll
         for (uint32_t j = 0; j <= i; j++)
         {
             uint64_t p = ((uint64_t) a[j]) * b[i - j];
@@ -112,8 +116,10 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         c = 0;
     }
     
+    #pragma unroll
     for (uint32_t i = 8; i < 15; i++)
     {
+        #pragma unroll
         for (uint32_t j = i - 7; j < 8; j++)
         {
             uint64_t p = ((uint64_t) a[j]) * b[i - j];
@@ -148,6 +154,7 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     // Note: SECP256K1_P = 2^256 - 2^32 - 977 (0x03d1 = 977)
     // multiply t[8]...t[15] by omega:
     
+    #pragma unroll
     for (uint32_t i = 0, j = 8; i < 8; i++, j++)
     {
         uint64_t p = ((uint64_t) 0x03d1) * t[j] + c;
@@ -171,6 +178,7 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     
     uint32_t c2 = 0;
     
+    #pragma unroll
     for (uint32_t i = 0, j = 8; i < 8; i++, j++)
     {
         uint64_t p = ((uint64_t) 0x3d1) * tmp[j] + c2;
@@ -201,11 +209,13 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     t[6] = SECP256K1_P6;
     t[7] = SECP256K1_P7;
     
+    #pragma unroll
     for (uint32_t i = c; i > 0; i--)
     {
         sub(r, r, t);
     }
     
+    #pragma unroll
     for (int i = 7; i >= 0; i--)
     {
         if (r[i] < t[i]) break;
@@ -379,6 +389,7 @@ __device__ void inv_mod(uint32_t* a) {
                 
                 uint32_t lt = 0;
                 
+                #pragma unroll
                 for (int i = 7; i >= 0; i--)
                 {
                     if (t2[i] < t3[i])
@@ -423,6 +434,7 @@ __device__ void inv_mod(uint32_t* a) {
                 
                 uint32_t lt = 0;
                 
+                #pragma unroll
                 for (int i = 7; i >= 0; i--)
                 {
                     if (t3[i] < t2[i])
