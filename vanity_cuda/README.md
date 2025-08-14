@@ -27,6 +27,15 @@ def main():
     use_parallel = True 
 
 ```
+### 性能调优
+
+1.逐步调高 @kernels.cu 中的 #define BATCH_WINDOW_SIZE 512    
+512会占用 12G显存 , 占用越多性能释放越好  
+2.拉高batch_size直到没有明显收益  
+3. 调整 Stage 2: Walker kernel 后面的 block_size 逐渐调高直到哈希速率开始下降  
+
+
+
 
 ## Performance
 
