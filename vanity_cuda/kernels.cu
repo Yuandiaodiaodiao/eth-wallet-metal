@@ -289,7 +289,7 @@ extern "C" __global__ void build_g16_table_kernel(
     uint32_t idx = start_idx + tid;
     if (idx >= 65536) return;
     
-    size_t offset = ((size_t)window * 65536 + idx) * 64;
+    uint64_t offset = ((uint64_t)window * 65536 + idx) * 64;
     uint8_t* out = g16_table + offset;
     
     if (idx == 0) {

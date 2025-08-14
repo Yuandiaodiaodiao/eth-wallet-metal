@@ -5,7 +5,6 @@ typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-typedef unsigned long long size_t;
 // Include secp256k1 constant definitions
 #define SECP256K1_B 7
 

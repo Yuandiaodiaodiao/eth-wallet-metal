@@ -25,8 +25,8 @@ from typing import List, Dict, Any, Optional
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
-from vanity_cuda.cuda_vanity import CudaVanity
-from vanity.privkey_gen import generate_valid_privkeys
+from cuda_vanity import CudaVanity
+from privkey_gen import generate_valid_privkeys
 
 class VanityAddressGenerator:
     """High-level interface for vanity address generation"""

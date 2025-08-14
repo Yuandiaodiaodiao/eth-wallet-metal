@@ -38,7 +38,7 @@ __device__ __forceinline__ void load_point_g16(uint32_t* x, uint32_t* y,
         return;
     }
     
-    size_t offset = ((size_t)window * 65536 + idx) * 64;
+    uint64_t offset = ((uint64_t)window * 65536 + idx) * 64;
     const uint8_t* ptr = g16_table + offset;
     
     // Load x coordinate (little-endian)

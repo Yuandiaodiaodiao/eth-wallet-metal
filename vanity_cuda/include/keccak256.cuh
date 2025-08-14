@@ -135,9 +135,9 @@ __device__ __forceinline__ void keccak256_64(const uint8_t* input, uint8_t* outp
 }
 
 // Generic Keccak-256 (for arbitrary length input)
-__device__ void keccak256(const uint8_t* input, size_t len, uint8_t* output) {
+__device__ void keccak256(const uint8_t* input, uint64_t len, uint8_t* output) {
     uint64_t state[25];
-    const size_t rate = 136; // Rate for Keccak-256 (1088 bits / 8)
+    const uint64_t rate = 136; // Rate for Keccak-256 (1088 bits / 8)
     
     // Initialize state
     #pragma unroll
@@ -146,15 +146,15 @@ __device__ void keccak256(const uint8_t* input, size_t len, uint8_t* output) {
     }
     
     // Absorb input
-    size_t absorbed = 0;
+    uint64_t absorbed = 0;
     while (absorbed < len) {
-        size_t to_absorb = (rate < len - absorbed) ? rate : len - absorbed;
+        uint64_t to_absorb = (rate < len - absorbed) ? rate : len - absorbed;
         
         // Absorb block
-        for (size_t i = 0; i < to_absorb; i += 8) {
-            size_t bytes = (to_absorb - i < 8) ? to_absorb - i : 8;
+        for (uint64_t i = 0; i < to_absorb; i += 8) {
+            uint64_t bytes = (to_absorb - i < 8) ? to_absorb - i : 8;
             uint64_t word = 0;
-            for (size_t j = 0; j < bytes; j++) {
+            for (uint64_t j = 0; j < bytes; j++) {
                 word |= ((uint64_t)input[absorbed + i + j]) << (8 * j);
             }
             state[i / 8] ^= word;
@@ -168,7 +168,7 @@ __device__ void keccak256(const uint8_t* input, size_t len, uint8_t* output) {
     }
     
     // Padding
-    size_t pad_pos = absorbed % rate;
+    uint64_t pad_pos = absorbed % rate;
     state[pad_pos / 8] ^= 0x01ULL << ((pad_pos % 8) * 8);
     state[(rate - 1) / 8] ^= 0x8000000000000000ULL;
     
