@@ -162,7 +162,7 @@ class CudaVanity:
         Returns:
             Tuple of (found_indices, gpu_time_seconds, addresses_bytes)
         """
-        
+        print(f"Generating {len(privkeys)} private keys...")
         num_keys = len(privkeys)
         
         # Prepare input data
@@ -228,7 +228,7 @@ class CudaVanity:
             Tuple of (found_indices, gpu_time_seconds)
         """
         
-        
+        print(f"Generating {len(privkeys)} private keys... {steps_per_thread} steps per thread {target_nibble} {nibble_count}   ")
              
         num_keys = len(privkeys)
         
@@ -253,7 +253,7 @@ class CudaVanity:
         block_size = 16
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
-        
+        print('launch compute base')
         launch(
             self.stream,
             config,
@@ -264,12 +264,13 @@ class CudaVanity:
             cp.uint32(num_keys)         # num_keys
         )
         
+        print('launch walker')
         # Stage 2: Walker kernel
         # Use smaller block size for walker due to higher register usage
-        block_size = 256
+        block_size = 64
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
-        
+        print(f'launch walker {grid_size} {block_size}')
         launch(
             self.stream,
             config,
@@ -282,9 +283,10 @@ class CudaVanity:
             cp.uint8(target_nibble),    # target_nibble
             cp.uint32(nibble_count)     # nibble_count
         )
-        
+        print('sync')
         # Wait for completion
         self.stream.sync()
+        print('sync done')
         gpu_time = time.perf_counter() - start_time
         
         # Get results

@@ -92,7 +92,10 @@ __device__ void point_mul_g16(uint32_t* x_out, uint32_t* y_out,
     
     // Convert to affine coordinates (manual implementation like Metal version)
     uint32_t z_inv[8];
-    inv_mod(z_inv, z);                    // z_inv = 1/z
+    for (int i = 0; i < 8; i++) {
+        z_inv[i] = z[i];
+    }
+    inv_mod(z_inv);                    // z_inv = 1/z
     uint32_t z2[8]; 
     mul_mod(z2, z_inv, z_inv);            // z2 = z_inv^2 = 1/z^2
     mul_mod(x, x, z2);                    // x = x * 1/z^2
@@ -122,8 +125,11 @@ __device__ void batch_inverse(uint32_t xs[][8], uint32_t ys[][8], uint32_t zs[][
     
     // Invert the total product
     uint32_t inv_total[8];
-    inv_mod(inv_total, temp_pref[batch_size - 1]);
-    
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        inv_total[j] = temp_pref[batch_size - 1][j];
+    }
+    inv_mod(inv_total);
     // Backward pass to get individual inverses and convert to affine
     for (int i = batch_size - 1; i >= 0; i--) {
         uint32_t inv_z[8];

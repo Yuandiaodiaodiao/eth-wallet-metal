@@ -5,105 +5,276 @@
 #include <cuda_runtime.h>
 
 // Point addition in Jacobian coordinates (mixed: z1 jacobian, z2=1 affine)
-// Based on reference implementation from inc_ecc_secp256k1.cl
-__device__ void point_add(uint32_t* x1, uint32_t* y1, uint32_t* z1,
-                         const uint32_t* x2, const uint32_t* y2) {
-    // Copy input values to temporary variables (t1=x1, t2=y1, t3=z1, t4=x2, t5=y2)
-    uint32_t t1[8], t2[8], t3[8], t4[8], t5[8];
-    uint32_t t6[8], t7[8], t8[8], t9[8];
+__device__ void point_add(uint32_t* x1, uint32_t* y1, uint32_t* z1, uint32_t* x2, uint32_t* y2) {
+    // x1/y1/z1:
     
-    // Copy input points
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        t1[i] = x1[i];  // t1 = x1
-        t2[i] = y1[i];  // t2 = y1  
-        t3[i] = z1[i];  // t3 = z1
-        t4[i] = x2[i];  // t4 = x2
-        t5[i] = y2[i];  // t5 = y2
-    }
+    uint32_t t1[8];
     
-    mul_mod(t6, t3, t3);    // t6 = t3^2 = z1^2
-    mul_mod(t7, t6, t3);    // t7 = t6*t3 = z1^3
-    mul_mod(t6, t6, t4);    // t6 = t6*t4 = z1^2 * x2
-    mul_mod(t7, t7, t5);    // t7 = t7*t5 = z1^3 * y2
+    t1[0] = x1[0];
+    t1[1] = x1[1];
+    t1[2] = x1[2];
+    t1[3] = x1[3];
+    t1[4] = x1[4];
+    t1[5] = x1[5];
+    t1[6] = x1[6];
+    t1[7] = x1[7];
     
-    sub_mod(t6, t6, t1);    // t6 = t6-t1 = z1^2*x2 - x1
-    sub_mod(t7, t7, t2);    // t7 = t7-t2 = z1^3*y2 - y1
+    uint32_t t2[8];
     
-    mul_mod(t8, t3, t6);    // t8 = t3*t6 = z1*(z1^2*x2 - x1)
-    mul_mod(t4, t6, t6);    // t4 = t6^2 = (z1^2*x2 - x1)^2
-    mul_mod(t9, t4, t6);    // t9 = t4*t6 = (z1^2*x2 - x1)^3
-    mul_mod(t4, t4, t1);    // t4 = t4*t1 = (z1^2*x2 - x1)^2 * x1
+    t2[0] = y1[0];
+    t2[1] = y1[1];
+    t2[2] = y1[2];
+    t2[3] = y1[3];
+    t2[4] = y1[4];
+    t2[5] = y1[5];
+    t2[6] = y1[6];
+    t2[7] = y1[7];
     
-    // Left shift (t4 * 2) with overflow handling
-    t6[7] = (t4[7] << 1) | (t4[6] >> 31);
-    t6[6] = (t4[6] << 1) | (t4[5] >> 31);
-    t6[5] = (t4[5] << 1) | (t4[4] >> 31);
-    t6[4] = (t4[4] << 1) | (t4[3] >> 31);
-    t6[3] = (t4[3] << 1) | (t4[2] >> 31);
-    t6[2] = (t4[2] << 1) | (t4[1] >> 31);
-    t6[1] = (t4[1] << 1) | (t4[0] >> 31);
+    uint32_t t3[8];
+    
+    t3[0] = z1[0];
+    t3[1] = z1[1];
+    t3[2] = z1[2];
+    t3[3] = z1[3];
+    t3[4] = z1[4];
+    t3[5] = z1[5];
+    t3[6] = z1[6];
+    t3[7] = z1[7];
+    
+    // x2/y2:
+    
+    uint32_t t4[8];
+    
+    t4[0] = x2[0];
+    t4[1] = x2[1];
+    t4[2] = x2[2];
+    t4[3] = x2[3];
+    t4[4] = x2[4];
+    t4[5] = x2[5];
+    t4[6] = x2[6];
+    t4[7] = x2[7];
+    
+    uint32_t t5[8];
+    
+    t5[0] = y2[0];
+    t5[1] = y2[1];
+    t5[2] = y2[2];
+    t5[3] = y2[3];
+    t5[4] = y2[4];
+    t5[5] = y2[5];
+    t5[6] = y2[6];
+    t5[7] = y2[7];
+    
+    uint32_t t6[8];
+    uint32_t t7[8];
+    uint32_t t8[8];
+    uint32_t t9[8];
+    
+    mul_mod(t6, t3, t3); // t6 = t3^2
+    
+    mul_mod(t7, t6, t3); // t7 = t6*t3
+    mul_mod(t6, t6, t4); // t6 = t6*t4
+    mul_mod(t7, t7, t5); // t7 = t7*t5
+    
+    sub_mod(t6, t6, t1); // t6 = t6-t1
+    sub_mod(t7, t7, t2); // t7 = t7-t2
+    
+    mul_mod(t8, t3, t6); // t8 = t3*t6
+    mul_mod(t4, t6, t6); // t4 = t6^2
+    mul_mod(t9, t4, t6); // t9 = t4*t6
+    mul_mod(t4, t4, t1); // t4 = t4*t1
+    
+    // left shift (t4 * 2):
+    
+    t6[7] = t4[7] << 1 | t4[6] >> 31;
+    t6[6] = t4[6] << 1 | t4[5] >> 31;
+    t6[5] = t4[5] << 1 | t4[4] >> 31;
+    t6[4] = t4[4] << 1 | t4[3] >> 31;
+    t6[3] = t4[3] << 1 | t4[2] >> 31;
+    t6[2] = t4[2] << 1 | t4[1] >> 31;
+    t6[1] = t4[1] << 1 | t4[0] >> 31;
     t6[0] = t4[0] << 1;
     
-    // Handle most significant bit overflow
-    if (t4[7] & 0x80000000) {
-        uint32_t a[8] = {0x000003d1, 1, 0, 0, 0, 0, 0, 0}; // omega value for mod P
+    // don't discard the most significant bit, it's important too!
+    
+    if (t4[7] & 0x80000000)
+    {
+        // use most significant bit and perform mod P, since we have: t4 * 2 % P
+        
+        uint32_t a[8] = { 0 };
+        
+        a[1] = 1;
+        a[0] = 0x000003d1; // omega (see: mul_mod ())
+        
         add(t6, t6, a);
     }
     
-    mul_mod(t5, t7, t7);    // t5 = t7*t7 = (z1^3*y2 - y1)^2
-    sub_mod(t5, t5, t6);    // t5 = t5-t6
-    sub_mod(t5, t5, t9);    // t5 = t5-t9
-    sub_mod(t4, t4, t5);    // t4 = t4-t5
+    mul_mod(t5, t7, t7); // t5 = t7*t7
     
-    mul_mod(t4, t4, t7);    // t4 = t4*t7
-    mul_mod(t9, t9, t2);    // t9 = t9*t2
-    sub_mod(t9, t4, t9);    // t9 = t4-t9
+    sub_mod(t5, t5, t6); // t5 = t5-t6
+    sub_mod(t5, t5, t9); // t5 = t5-t9
+    sub_mod(t4, t4, t5); // t4 = t4-t5
     
-    // Store results back to x1, y1, z1
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        x1[i] = t5[i];  // x1 = t5
-        y1[i] = t9[i];  // y1 = t9
-        z1[i] = t8[i];  // z1 = t8
-    }
+    mul_mod(t4, t4, t7); // t4 = t4*t7
+    mul_mod(t9, t9, t2); // t9 = t9*t2
+    
+    sub_mod(t9, t4, t9); // t9 = t4-t9
+    
+    x1[0] = t5[0];
+    x1[1] = t5[1];
+    x1[2] = t5[2];
+    x1[3] = t5[3];
+    x1[4] = t5[4];
+    x1[5] = t5[5];
+    x1[6] = t5[6];
+    x1[7] = t5[7];
+    
+    y1[0] = t9[0];
+    y1[1] = t9[1];
+    y1[2] = t9[2];
+    y1[3] = t9[3];
+    y1[4] = t9[4];
+    y1[5] = t9[5];
+    y1[6] = t9[6];
+    y1[7] = t9[7];
+    
+    z1[0] = t8[0];
+    z1[1] = t8[1];
+    z1[2] = t8[2];
+    z1[3] = t8[3];
+    z1[4] = t8[4];
+    z1[5] = t8[5];
+    z1[6] = t8[6];
+    z1[7] = t8[7];
 }
 
 // Point doubling in Jacobian coordinates
-__device__ void point_double(uint32_t* x3, uint32_t* y3, uint32_t* z3,
-                            const uint32_t* x1, const uint32_t* y1, const uint32_t* z1) {
-    uint32_t s[8], m[8], t[8];
+__device__ void point_double(uint32_t* x, uint32_t* y, uint32_t* z) {
+    // Copy input values to temporary variables
+    uint32_t t1[8];
     
-    // s = 4 * x1 * y1^2
-    uint32_t y1y1[8];
-    mul_mod(y1y1, y1, y1);
-    mul_mod(s, x1, y1y1);
-    add_mod(s, s, s);
-    add_mod(s, s, s);
+    t1[0] = x[0];
+    t1[1] = x[1];
+    t1[2] = x[2];
+    t1[3] = x[3];
+    t1[4] = x[4];
+    t1[5] = x[5];
+    t1[6] = x[6];
+    t1[7] = x[7];
     
-    // m = 3 * x1^2 (for a=0 curve)
-    uint32_t x1x1[8];
-    mul_mod(x1x1, x1, x1);
-    add_mod(m, x1x1, x1x1);
-    add_mod(m, m, x1x1);
+    uint32_t t2[8];
     
-    // t = m^2 - 2*s
-    mul_mod(t, m, m);
-    sub_mod(t, t, s);
-    sub_mod(x3, t, s);
+    t2[0] = y[0];
+    t2[1] = y[1];
+    t2[2] = y[2];
+    t2[3] = y[3];
+    t2[4] = y[4];
+    t2[5] = y[5];
+    t2[6] = y[6];
+    t2[7] = y[7];
     
-    // y3 = m * (s - x3) - 8 * y1^4
-    sub_mod(t, s, x3);
-    mul_mod(t, m, t);
-    mul_mod(y1y1, y1y1, y1y1);
-    add_mod(y1y1, y1y1, y1y1);
-    add_mod(y1y1, y1y1, y1y1);
-    add_mod(y1y1, y1y1, y1y1);
-    sub_mod(y3, t, y1y1);
+    uint32_t t3[8];
     
-    // z3 = 2 * y1 * z1
-    mul_mod(z3, y1, z1);
-    add_mod(z3, z3, z3);
+    t3[0] = z[0];
+    t3[1] = z[1];
+    t3[2] = z[2];
+    t3[3] = z[3];
+    t3[4] = z[4];
+    t3[5] = z[5];
+    t3[6] = z[6];
+    t3[7] = z[7];
+    
+    uint32_t t4[8];
+    uint32_t t5[8];
+    uint32_t t6[8];
+    
+    mul_mod(t4, t1, t1); // t4 = x^2
+    
+    mul_mod(t5, t2, t2); // t5 = y^2
+    
+    mul_mod(t1, t1, t5); // t1 = x*y^2
+    
+    mul_mod(t5, t5, t5); // t5 = t5^2 = y^4
+    
+    // here the z^2 and z^4 is not needed for a = 0
+    
+    mul_mod(t3, t2, t3); // t3 = y * z
+    
+    add_mod(t2, t4, t4); // t2 = 2 * t4 = 2 * x^2
+    add_mod(t4, t4, t2); // t4 = 3 * t4 = 3 * x^2
+    
+    // a * z^4 = 0 * 1^4 = 0
+    
+    // don't discard the least significant bit it's important too!
+    
+    uint32_t c = 0;
+    
+    if (t4[0] & 1)
+    {
+        uint32_t t[8];
+        
+        t[0] = SECP256K1_P0;
+        t[1] = SECP256K1_P1;
+        t[2] = SECP256K1_P2;
+        t[3] = SECP256K1_P3;
+        t[4] = SECP256K1_P4;
+        t[5] = SECP256K1_P5;
+        t[6] = SECP256K1_P6;
+        t[7] = SECP256K1_P7;
+        
+        c = add(t4, t4, t); // t4 + SECP256K1_P
+    }
+    
+    // right shift (t4 / 2):
+    
+    t4[0] = t4[0] >> 1 | t4[1] << 31;
+    t4[1] = t4[1] >> 1 | t4[2] << 31;
+    t4[2] = t4[2] >> 1 | t4[3] << 31;
+    t4[3] = t4[3] >> 1 | t4[4] << 31;
+    t4[4] = t4[4] >> 1 | t4[5] << 31;
+    t4[5] = t4[5] >> 1 | t4[6] << 31;
+    t4[6] = t4[6] >> 1 | t4[7] << 31;
+    t4[7] = t4[7] >> 1 | c << 31;
+    
+    mul_mod(t6, t4, t4); // t6 = t4^2 = (3/2 * x^2)^2
+    
+    add_mod(t2, t1, t1); // t2 = 2 * t1
+    
+    sub_mod(t6, t6, t2); // t6 = t6 - t2
+    sub_mod(t1, t1, t6); // t1 = t1 - t6
+    
+    mul_mod(t4, t4, t1); // t4 = t4 * t1
+    
+    sub_mod(t1, t4, t5); // t1 = t4 - t5
+    
+    // => x = t6, y = t1, z = t3:
+    
+    x[0] = t6[0];
+    x[1] = t6[1];
+    x[2] = t6[2];
+    x[3] = t6[3];
+    x[4] = t6[4];
+    x[5] = t6[5];
+    x[6] = t6[6];
+    x[7] = t6[7];
+    
+    y[0] = t1[0];
+    y[1] = t1[1];
+    y[2] = t1[2];
+    y[3] = t1[3];
+    y[4] = t1[4];
+    y[5] = t1[5];
+    y[6] = t1[6];
+    y[7] = t1[7];
+    
+    z[0] = t3[0];
+    z[1] = t3[1];
+    z[2] = t3[2];
+    z[3] = t3[3];
+    z[4] = t3[4];
+    z[5] = t3[5];
+    z[6] = t3[6];
+    z[7] = t3[7];
 }
 
 // Convert Jacobian to affine coordinates
@@ -112,7 +283,10 @@ __device__ void jacobian_to_affine(uint32_t* x_affine, uint32_t* y_affine,
     uint32_t z_inv[8], z_inv2[8], z_inv3[8];
     
     // z_inv = 1/z
-    inv_mod(z_inv, z);
+    for (int i = 0; i < 8; i++) {
+        z_inv[i] = z[i];
+    }
+    inv_mod(z_inv);
     
     // z_inv2 = z_inv^2
     mul_mod(z_inv2, z_inv, z_inv);
@@ -127,8 +301,8 @@ __device__ void jacobian_to_affine(uint32_t* x_affine, uint32_t* y_affine,
     mul_mod(y_affine, y, z_inv3);
 }
 
-// Scalar multiplication using double-and-add method
-__device__ void point_mul(uint32_t* x_out, uint32_t* y_out, const uint32_t* k) {
+// Simple scalar multiplication using double-and-add method (for reference/testing)
+__device__ void point_mul_simple(uint32_t* x_out, uint32_t* y_out, const uint32_t* k) {
     uint32_t x[8] = {0}, y[8] = {0}, z[8] = {0};
     bool first = true;
     
@@ -139,7 +313,7 @@ __device__ void point_mul(uint32_t* x_out, uint32_t* y_out, const uint32_t* k) {
         int bit_idx = bit & 31;
         
         if (!first) {
-            point_double(x, y, z, x, y, z);
+            point_double(x, y, z);
         }
         
         if ((k[limb_idx] >> bit_idx) & 1) {
@@ -245,7 +419,7 @@ __device__ void point_mul_xy(uint32_t* x1, uint32_t* y1, const uint32_t* k, cons
     
     int loop_start = convert_to_window_naf(naf, k);
     
-    // First set
+    // first set:
     const uint32_t multiplier = (naf[loop_start >> 3] >> ((loop_start & 7) << 2)) & 0x0f;
     
     const uint32_t odd = multiplier & 1;
@@ -253,49 +427,84 @@ __device__ void point_mul_xy(uint32_t* x1, uint32_t* y1, const uint32_t* k, cons
     const uint32_t x_pos = ((multiplier - 1 + odd) >> 1) * 24;
     const uint32_t y_pos = odd ? (x_pos + 8) : (x_pos + 16);
     
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        x1[i] = tmps->xy[x_pos + i];
-        y1[i] = tmps->xy[y_pos + i];
-    }
-    
+    x1[0] = tmps->xy[x_pos + 0];
+    x1[1] = tmps->xy[x_pos + 1];
+    x1[2] = tmps->xy[x_pos + 2];
+    x1[3] = tmps->xy[x_pos + 3];
+    x1[4] = tmps->xy[x_pos + 4];
+    x1[5] = tmps->xy[x_pos + 5];
+    x1[6] = tmps->xy[x_pos + 6];
+    x1[7] = tmps->xy[x_pos + 7];
+
+    y1[0] = tmps->xy[y_pos + 0];
+    y1[1] = tmps->xy[y_pos + 1];
+    y1[2] = tmps->xy[y_pos + 2];
+    y1[3] = tmps->xy[y_pos + 3];
+    y1[4] = tmps->xy[y_pos + 4];
+    y1[5] = tmps->xy[y_pos + 5];
+    y1[6] = tmps->xy[y_pos + 6];
+    y1[7] = tmps->xy[y_pos + 7];
+
     uint32_t z1[8] = {0};
+    
     z1[0] = 1;
     
-    // Main loop (left-to-right binary algorithm)
-    for (int pos = loop_start - 1; pos >= 0; pos--) {
-        // Always double
-        point_double(x1, y1, z1, x1, y1, z1);
+    // main loop (left-to-right binary algorithm):
+    for (int pos = loop_start - 1; pos >= 0; pos--) // -1 because we've set/add the point already
+    {
+        // always double:
+        point_double(x1, y1, z1);
         
-        // Add only if needed
+        // add only if needed:
         const uint32_t multiplier = (naf[pos >> 3] >> ((pos & 7) << 2)) & 0x0f;
         
-        if (multiplier) {
+        if (multiplier)
+        {
             const uint32_t odd = multiplier & 1;
             
             const uint32_t x_pos = ((multiplier - 1 + odd) >> 1) * 24;
             const uint32_t y_pos = odd ? (x_pos + 8) : (x_pos + 16);
             
-            uint32_t x2[8], y2[8];
+            uint32_t x2[8];
             
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                x2[i] = tmps->xy[x_pos + i];
-                y2[i] = tmps->xy[y_pos + i];
-            }
+            x2[0] = tmps->xy[x_pos + 0];
+            x2[1] = tmps->xy[x_pos + 1];
+            x2[2] = tmps->xy[x_pos + 2];
+            x2[3] = tmps->xy[x_pos + 3];
+            x2[4] = tmps->xy[x_pos + 4];
+            x2[5] = tmps->xy[x_pos + 5];
+            x2[6] = tmps->xy[x_pos + 6];
+            x2[7] = tmps->xy[x_pos + 7];
+
+            uint32_t y2[8];
+
+            y2[0] = tmps->xy[y_pos + 0];
+            y2[1] = tmps->xy[y_pos + 1];
+            y2[2] = tmps->xy[y_pos + 2];
+            y2[3] = tmps->xy[y_pos + 3];
+            y2[4] = tmps->xy[y_pos + 4];
+            y2[5] = tmps->xy[y_pos + 5];
+            y2[6] = tmps->xy[y_pos + 6];
+            y2[7] = tmps->xy[y_pos + 7];
             
-            // (x1, y1, z1) + (x2, y2, 1)
+            // (x1, y1, z1) + multiplier * (x, y, z) = (x1, y1, z1) + (x2, y2, z2)
             point_add(x1, y1, z1, x2, y2);
         }
     }
     
-    // Convert to affine coordinates
-    inv_mod(z1, z1);
+    /*
+     * Get the corresponding affine coordinates x/y:
+     */
+    
+    inv_mod(z1);
     
     uint32_t z2[8];
+    
     mul_mod(z2, z1, z1); // z1^2
     mul_mod(x1, x1, z2); // x1_affine
     
     mul_mod(z1, z2, z1); // z1^3
     mul_mod(y1, y1, z1); // y1_affine
+    
+    // return values are already in x1 and y1
 }

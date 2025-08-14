@@ -1,0 +1,1 @@
+python vanity_main.py

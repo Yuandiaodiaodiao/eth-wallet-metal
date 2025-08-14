@@ -1,14 +1,8 @@
 #ifndef KECCAK256_CUH
 #define KECCAK256_CUH
 
+#include "math_utils.cuh"
 #include <cuda_runtime.h>
-
-// Basic type definitions
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-typedef unsigned long long size_t;
 
 // Keccak-256 round constants
 __constant__ uint64_t KECCAK_RC[24] = {
@@ -155,11 +149,11 @@ __device__ void keccak256(const uint8_t* input, size_t len, uint8_t* output) {
     // Absorb input
     size_t absorbed = 0;
     while (absorbed < len) {
-        size_t to_absorb = min(rate, len - absorbed);
+        size_t to_absorb = (rate < len - absorbed) ? rate : len - absorbed;
         
         // Absorb block
         for (size_t i = 0; i < to_absorb; i += 8) {
-            size_t bytes = min((size_t)8, to_absorb - i);
+            size_t bytes = (to_absorb - i < 8) ? to_absorb - i : 8;
             uint64_t word = 0;
             for (size_t j = 0; j < bytes; j++) {
                 word |= ((uint64_t)input[absorbed + i + j]) << (8 * j);
@@ -223,5 +217,6 @@ __device__ __forceinline__ bool check_vanity(const uint8_t* addr20, uint8_t nibb
     
     return true;
 }
+
 
 #endif // KECCAK256_CUH

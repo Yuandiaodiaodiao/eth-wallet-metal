@@ -1,13 +1,12 @@
-#include "include/constants.cuh"
-#include "include/secp256k1.cuh"
-#include "include/inc_ecc_secp256k1.cuh"
-#include "include/keccak256.cuh"
-#include "include/ec_ops.cuh"
-#include "include/g16_ops.cuh"
+// CUDA runtime
 #include <cuda_runtime.h>
 
-// Batch size for walker kernel
-#define BATCH_WINDOW_SIZE 256
+// Secp256k1 elliptic curve implementation
+#include "include/secp256k1.cuh"
+#include "include/keccak256.cuh"
+
+// Batch size for walker kernel (matches Metal implementation)
+#define BATCH_WINDOW_SIZE 1
 
 // ======================
 // CUDA Kernel Functions
@@ -41,21 +40,18 @@ extern "C" __global__ void vanity_kernel_g16(
                      ((uint32_t)privkey[off + 3]);
         k_be[i] = w;
     }
-    uint8_t* out_addr = outbuffer + gid * 20;
+
+    // uint8_t* out_addr = outbuffer + gid * 20;
     
     uint32_t k_local[8];
     k_local[7] = k_be[0]; k_local[6] = k_be[1]; k_local[5] = k_be[2]; k_local[4] = k_be[3];
     k_local[3] = k_be[4]; k_local[2] = k_be[5]; k_local[1] = k_be[6]; k_local[0] = k_be[7];
-    
+     
+   
     // Compute public key: (x, y) = k * G
     uint32_t x[8], y[8];
     point_mul_xy(x, y, k_local, &G_PRECOMP);
-    
-    // Store address in output buffer
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        out_addr[i] = x[i];
-    }
+   
 
     // pack pub (x||y) big-endian into thread buffer
     uint8_t pubkey[64];
@@ -84,7 +80,9 @@ extern "C" __global__ void vanity_kernel_g16(
     uint8_t addr[20];
     eth_address(pubkey, addr);
     
-  
+    // for (int i = 0; i < 20; i++) {
+    //     out_addr[i] = addr[i];
+    // }
     
     // Check vanity pattern
     if (check_vanity(addr, target_nibble, nibble_count)) {
@@ -108,16 +106,21 @@ extern "C" __global__ void compute_basepoints_g16(
     uint32_t k[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        k[7 - i] = ((uint32_t)privkey[i*4] << 24) |
-                   ((uint32_t)privkey[i*4 + 1] << 16) |
-                   ((uint32_t)privkey[i*4 + 2] << 8) |
-                   ((uint32_t)privkey[i*4 + 3]);
+        int off = i * 4;
+        k[i] = ((uint32_t)privkey[off] << 24) |
+                   ((uint32_t)privkey[off + 1] << 16) |
+                   ((uint32_t)privkey[off + 2] << 8) |
+                   ((uint32_t)privkey[off + 3]);
+
     }
-    
+    uint32_t k_local[8];
+    k_local[7] = k[0]; k_local[6] = k[1]; k_local[5] = k[2]; k_local[4] = k[3];
+    k_local[3] = k[4]; k_local[2] = k[5]; k_local[1] = k[6]; k_local[0] = k[7];
+     
     // Compute base point
     uint32_t x[8], y[8];
-    point_mul_g16(x, y, k, g16_table);
-    
+    // point_mul_g16(x, y, k, g16_table);
+    point_mul_xy(x, y, k_local, &G_PRECOMP);
     // Store result
     uint32_t* out = basepoints + gid * 16;
     #pragma unroll
@@ -127,7 +130,7 @@ extern "C" __global__ void compute_basepoints_g16(
     }
 }
 
-// Walker kernel: generate multiple addresses per thread
+// Walker kernel: generate multiple addresses per thread (following Metal implementation)
 extern "C" __global__ void vanity_walker_kernel(
     const uint32_t* __restrict__ basepoints,   // Precomputed base points
     uint32_t* __restrict__ found_indices,      // Output indices
@@ -140,80 +143,133 @@ extern "C" __global__ void vanity_walker_kernel(
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= num_keys) return;
     
-    // Load base point
-    const uint32_t* base = basepoints + gid * 16;
+    // Load precomputed base point (x0, y0) and initialize z0
+    const uint32_t* base_point = basepoints + gid * 16;
     uint32_t x0[8], y0[8], z0[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        x0[i] = base[i];
-        y0[i] = base[8 + i];
-        z0[i] = (i == 0) ? 1 : 0;
+        x0[i] = base_point[i];
+        y0[i] = base_point[8 + i];
+        z0[i] = 0;  // Initialize z0
     }
+    z0[0] = 1;
     
-    // Load generator G for incremental addition
-    uint32_t gx[8], gy[8];
+    // Prepare delta = G (affine)
+    uint32_t dx[8], dy[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        gx[i] = SECP256K1_G[i];
-        gy[i] = SECP256K1_G[8 + i];
+        dx[i] = SECP256K1_G[i];
+        dy[i] = SECP256K1_G[8 + i];
     }
     
-    // Process in batches to use Montgomery's trick for batch inversion
-    const int batch_size = min((int)steps_per_thread, BATCH_WINDOW_SIZE);
-    uint32_t xs[BATCH_WINDOW_SIZE][8];
-    uint32_t ys[BATCH_WINDOW_SIZE][8];
-    uint32_t zs[BATCH_WINDOW_SIZE][8];
-    uint32_t temp_pref[BATCH_WINDOW_SIZE][8];
     
-    for (uint32_t batch_start = 0; batch_start < steps_per_thread; batch_start += batch_size) {
-        int current_batch = min(batch_size, (int)(steps_per_thread - batch_start));
-        
-        // Generate batch of points
-        for (int i = 0; i < current_batch; i++) {
+    // Stack arrays for batch processing - fixed size to avoid overflow
+    uint32_t xs[BATCH_WINDOW_SIZE][8];
+    uint32_t ys[BATCH_WINDOW_SIZE][8]; 
+    uint32_t zs[BATCH_WINDOW_SIZE][8];
+    uint32_t pref[BATCH_WINDOW_SIZE][8];
+    
+    // Process in batches of BATCH_WINDOW_SIZE to avoid stack overflow
+    uint32_t processed = 0;
+    while (processed < steps_per_thread) {
+        // Generate batch_size points by repeated addition
+        for (int i = 0; i < BATCH_WINDOW_SIZE; ++i) {
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                xs[i][j] = x0[j];
-                ys[i][j] = y0[j];
-                zs[i][j] = z0[j];
+            for (int k = 0; k < 8; ++k) {
+                xs[i][k] = x0[k];
+                ys[i][k] = y0[k];
+                zs[i][k] = z0[k];
             }
-            
-            // x0 = x0 + G
-            point_add(x0, y0, z0, gx, gy);
+            point_add(x0, y0, z0, dx, dy);
         }
         
-        // Batch inversion to convert all points to affine
-        batch_inverse(xs, ys, zs, temp_pref, current_batch);
+        // Batch inversion using Montgomery trick
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            pref[0][k] = zs[0][k];
+        }
+        for (int i = 1; i < BATCH_WINDOW_SIZE; ++i) {
+            mul_mod(pref[i], pref[i-1], zs[i]);
+        }
         
-        // Check each address in the batch
-        for (int i = 0; i < current_batch; i++) {
-            // Convert to bytes for hashing
-            uint8_t pubkey[64];
+        // Inverse total
+        uint32_t inv_total[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            inv_total[k] = pref[BATCH_WINDOW_SIZE-1][k];
+        }
+        inv_mod(inv_total);
+        
+        // Backward pass and vanity check
+        for (int ii = (int)BATCH_WINDOW_SIZE-1; ii >= 0; --ii) {
+            uint32_t inv_z[8];
+            if (ii == 0) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    inv_z[k] = inv_total[k];
+                }
+            } else {
+                mul_mod(inv_z, inv_total, pref[ii-1]);
+            }
+            mul_mod(inv_total, inv_total, zs[ii]);
+            
+            // Convert to affine coordinates
+            uint32_t z2[8];
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                uint32_t val = xs[i][7 - j];
-                pubkey[j*4] = (val >> 24) & 0xFF;
-                pubkey[j*4 + 1] = (val >> 16) & 0xFF;
-                pubkey[j*4 + 2] = (val >> 8) & 0xFF;
-                pubkey[j*4 + 3] = val & 0xFF;
+            for (int k = 0; k < 8; ++k) {
+                z2[k] = inv_z[k];
+            }
+            mul_mod(z2, z2, z2);
+            
+            uint32_t xa[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                xa[k] = xs[ii][k];
+            }
+            mul_mod(xa, xa, z2);
+            
+            uint32_t z3[8];
+            mul_mod(z3, z2, inv_z);
+            uint32_t ya[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                ya[k] = ys[ii][k];
+            }
+            mul_mod(ya, ya, z3);
+            
+            // Pack public key and compute Keccak
+            uint8_t pub[64];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                uint32_t w = xa[7-k];
+                int off = k * 4;
+                pub[off] = w >> 24;
+                pub[off+1] = w >> 16;
+                pub[off+2] = w >> 8;
+                pub[off+3] = w;
             }
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                uint32_t val = ys[i][7 - j];
-                pubkey[32 + j*4] = (val >> 24) & 0xFF;
-                pubkey[32 + j*4 + 1] = (val >> 16) & 0xFF;
-                pubkey[32 + j*4 + 2] = (val >> 8) & 0xFF;
-                pubkey[32 + j*4 + 3] = val & 0xFF;
+            for (int k = 0; k < 8; ++k) {
+                uint32_t w = ya[7-k];
+                int off = 32 + k * 4;
+                pub[off] = w >> 24;
+                pub[off+1] = w >> 16;
+                pub[off+2] = w >> 8;
+                pub[off+3] = w;
             }
             
-            // Compute address and check vanity
             uint8_t addr[20];
-            eth_address(pubkey, addr);
+            eth_address(pub, addr);
             
+        
+
             if (check_vanity(addr, target_nibble, nibble_count)) {
                 atomicAdd(found_count, 1);
-                found_indices[0] = gid * steps_per_thread + batch_start + i;
+                found_indices[0] = gid * steps_per_thread + processed + (uint32_t)ii;
             }
         }
+        
+        processed += BATCH_WINDOW_SIZE;
     }
 }
 
@@ -262,7 +318,7 @@ extern "C" __global__ void build_g16_table_kernel(
         int bit_idx = bit & 31;
         
         if (!first) {
-            point_double(x, y, z, x, y, z);
+            point_double(x, y, z);
         }
         
         if ((k[limb_idx] >> bit_idx) & 1) {

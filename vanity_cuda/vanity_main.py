@@ -58,12 +58,13 @@ class VanityAddressGenerator:
         # Generate private keys
         print(f"Generating {batch_size} private keys...")
         privkeys = generate_private_keys(batch_size)
-        privkeys = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
+        # privkeys = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
         # for i in range(len(privkeys)):
         #     print(f"privkeys[{i}] = {privkeys[i].hex()}")
         # Run GPU kernel
         
         if use_walker:
+            print('use worker')
             indices, gpu_time = self.cuda_generator.generate_vanity_walker(
                 privkeys,
                 steps_per_thread=steps_per_thread,
@@ -122,13 +123,14 @@ class VanityAddressGenerator:
         
         # Print addresses only when not using walker mode
         if not use_walker and all_addresses is not None:
-            print(f"\nAddresses from batch:")
-            for i in range(min(10, batch_size)):  # Show first 10 addresses
-                addr_bytes = all_addresses[i*20:(i+1)*20]
-                addr_hex = "0x" + addr_bytes.tobytes().hex()
-                privkey_hex = privkeys[i].hex()
-                print(f"  privkey[{i}]: {privkey_hex}")
-                print(f"  address[{i}]: {addr_hex}")
+            pass
+            # print(f"\nAddresses from batch:")
+            # for i in range(min(10, batch_size)):  # Show first 10 addresses
+            #     addr_bytes = all_addresses[i*20:(i+1)*20]
+            #     addr_hex = "0x" + addr_bytes.tobytes().hex()
+            #     privkey_hex = privkeys[i].hex()
+            #     print(f"  privkey[{i}]: {privkey_hex}")
+            #     print(f"  address[{i}]: {addr_hex}")
         
         return results
     
@@ -181,6 +183,7 @@ class VanityAddressGenerator:
                 # Save results periodically
                 if len(all_matches) > 0:
                     print(f"ans = {all_matches[0]}")
+                    break
                     
         except KeyboardInterrupt:
             print("\n\nStopping generation...")
@@ -216,12 +219,12 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "888"
-    batch_size = 1
+    pattern = "8888"
+    batch_size = 4096
     steps = 1
     device = 0
     benchmark = False
-    useWalker = False
+    useWalker = True
     # Initialize generator
     generator = VanityAddressGenerator(device_id=device)
     
