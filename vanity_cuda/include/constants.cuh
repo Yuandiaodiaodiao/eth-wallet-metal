@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cuda_runtime.h>
 // Basic type definitions
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;

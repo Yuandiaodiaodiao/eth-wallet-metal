@@ -5,7 +5,6 @@
 #include "math_utils.cuh"
 #include "ec_ops.cuh"
 #include "g16_ops.cuh"
-#include <cuda_runtime.h>
 
 // High-level interface functions for public key operations
 __device__ uint32_t transform_public(secp256k1_t* r, const uint32_t* x, const uint32_t first_byte);

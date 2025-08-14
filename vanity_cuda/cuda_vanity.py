@@ -149,21 +149,51 @@ class CudaVanity:
     
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
-                              target_nibble: int = 0x8,
-                              nibble_count: int = 7) -> Tuple[List[int], float, bytes]:
+                              head_pattern: str = "",
+                              tail_pattern: str = "") -> Tuple[List[int], float, bytes]:
         """
         Generate vanity addresses using simple kernel (one address per thread)
         
         Args:
             privkeys: List of 32-byte private keys (big-endian)
-            target_nibble: Target nibble value (0x0-0xF)
-            nibble_count: Number of nibbles to match
+            head_pattern: Hex pattern for address prefix (e.g., "888" for 0x888...)
+            tail_pattern: Hex pattern for address suffix (e.g., "abc" for ...abc)
             
         Returns:
             Tuple of (found_indices, gpu_time_seconds, addresses_bytes)
         """
         print(f"Generating {len(privkeys)} private keys...")
         num_keys = len(privkeys)
+        
+        # Convert pattern strings to byte arrays
+        def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
+            if not pattern:
+                return cp.zeros(0, dtype=cp.uint8), 0
+            
+            pattern = pattern.lower()
+            nibble_count = len(pattern)
+            byte_count = (nibble_count + 1) // 2
+            
+            # Convert hex string to bytes (packed nibbles)
+            pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
+            for i in range(0, len(pattern), 2):
+                if i + 1 < len(pattern):
+                    # Two nibbles -> one byte
+                    pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
+                else:
+                    # One nibble -> half byte (left-padded)
+                    pattern_bytes[i // 2] = int(pattern[i], 16) << 4
+            
+            return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
+        
+        d_head_pattern, head_nibbles = pattern_to_bytes(head_pattern)
+        d_tail_pattern, tail_nibbles = pattern_to_bytes(tail_pattern)
+        
+        # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
+        if head_nibbles == 0:
+            d_head_pattern = cp.zeros(1, dtype=cp.uint8)
+        if tail_nibbles == 0:
+            d_tail_pattern = cp.zeros(1, dtype=cp.uint8)
         
         # Prepare input data
         privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
@@ -195,8 +225,10 @@ class CudaVanity:
             d_outbuffer.data.ptr,       # outbuffer
             self.g16_table.data.ptr,    # g16_table
             cp.uint32(num_keys),        # num_keys
-            cp.uint8(target_nibble),    # target_nibble
-            cp.uint32(nibble_count)     # nibble_count
+            d_head_pattern.data.ptr,    # head_pattern
+            cp.uint32(head_nibbles),    # head_nibbles
+            d_tail_pattern.data.ptr,    # tail_pattern
+            cp.uint32(tail_nibbles)     # tail_nibbles
         )
         
         # Wait for completion
@@ -213,24 +245,54 @@ class CudaVanity:
     def generate_vanity_walker(self,
                                privkeys: List[bytes],
                                steps_per_thread: int = 256,
-                               target_nibble: int = 0x8,
-                               nibble_count: int = 7) -> Tuple[List[int], float]:
+                               head_pattern: str = "",
+                               tail_pattern: str = "") -> Tuple[List[int], float]:
         """
         Generate vanity addresses using walker kernel (multiple addresses per thread)
         
         Args:
             privkeys: List of 32-byte private keys (big-endian)
             steps_per_thread: Number of addresses to check per thread
-            target_nibble: Target nibble value (0x0-0xF)
-            nibble_count: Number of nibbles to match
+            head_pattern: Hex pattern for address prefix (e.g., "888" for 0x888...)
+            tail_pattern: Hex pattern for address suffix (e.g., "abc" for ...abc)
             
         Returns:
-            Tuple of (found_indices, gpu_time_seconds)
+            Tuple of (found_indices, gpu_time_seconds, middle_gpu_time_seconds)
         """
         
-        print(f"Generating {len(privkeys)} private keys... {steps_per_thread} steps per thread {target_nibble} {nibble_count}   ")
+        print(f"Generating {len(privkeys)} private keys... {steps_per_thread} steps per thread, head: '{head_pattern}', tail: '{tail_pattern}'")
              
         num_keys = len(privkeys)
+        
+        # Convert pattern strings to byte arrays
+        def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
+            if not pattern:
+                return cp.zeros(0, dtype=cp.uint8), 0
+            
+            pattern = pattern.lower()
+            nibble_count = len(pattern)
+            byte_count = (nibble_count + 1) // 2
+            
+            # Convert hex string to bytes (packed nibbles)
+            pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
+            for i in range(0, len(pattern), 2):
+                if i + 1 < len(pattern):
+                    # Two nibbles -> one byte
+                    pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
+                else:
+                    # One nibble -> half byte (left-padded)
+                    pattern_bytes[i // 2] = int(pattern[i], 16) << 4
+            
+            return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
+        
+        d_head_pattern, head_nibbles = pattern_to_bytes(head_pattern)
+        d_tail_pattern, tail_nibbles = pattern_to_bytes(tail_pattern)
+        
+        # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
+        if head_nibbles == 0:
+            d_head_pattern = cp.zeros(1, dtype=cp.uint8)
+        if tail_nibbles == 0:
+            d_tail_pattern = cp.zeros(1, dtype=cp.uint8)
         
         # Prepare input data
         privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
@@ -281,8 +343,10 @@ class CudaVanity:
             d_found_count.data.ptr,     # found_count
             cp.uint32(num_keys),        # num_keys
             cp.uint32(steps_per_thread), # steps_per_thread
-            cp.uint8(target_nibble),    # target_nibble
-            cp.uint32(nibble_count)     # nibble_count
+            d_head_pattern.data.ptr,    # head_pattern
+            cp.uint32(head_nibbles),    # head_nibbles
+            d_tail_pattern.data.ptr,    # tail_pattern
+            cp.uint32(tail_nibbles)     # tail_nibbles
         )
         print('sync')
         # Wait for completion
@@ -305,7 +369,7 @@ class CudaVanity:
         
         # Test simple kernel
         print("\nSimple kernel (1 address per thread):")
-        indices, gpu_time = self.generate_vanity_simple(privkeys, target_nibble=0x0, nibble_count=1)
+        indices, gpu_time, _ = self.generate_vanity_simple(privkeys, head_pattern="0")
         addresses_checked = num_keys
         throughput = addresses_checked / gpu_time / 1e6  # Million addresses per second
         print(f"  GPU time: {gpu_time:.3f} seconds")
@@ -315,9 +379,9 @@ class CudaVanity:
         
         # Test walker kernel
         print(f"\nWalker kernel ({steps_per_thread} addresses per thread):")
-        indices, gpu_time = self.generate_vanity_walker(
+        indices, gpu_time, _ = self.generate_vanity_walker(
             privkeys, steps_per_thread=steps_per_thread, 
-            target_nibble=0x0, nibble_count=1
+            head_pattern="0"
         )
         addresses_checked = num_keys * steps_per_thread
         throughput = addresses_checked / gpu_time / 1e6
@@ -343,11 +407,10 @@ def main():
     test_keys = [os.urandom(32) for _ in range(1000)]
     
     # Search for addresses starting with 0x888
-    indices, gpu_time = generator.generate_vanity_walker(
+    indices, gpu_time, _ = generator.generate_vanity_walker(
         test_keys, 
         steps_per_thread=1000,
-        target_nibble=0x8,
-        nibble_count=3
+        head_pattern="888"
     )
     
     if indices:

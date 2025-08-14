@@ -2,7 +2,6 @@
 
 #include "constants.cuh"
 #include "math_utils.cuh"
-#include <cuda_runtime.h>
 
 // Point addition in Jacobian coordinates (mixed: z1 jacobian, z2=1 affine)
 __device__ void point_add(uint32_t* x1, uint32_t* y1, uint32_t* z1, uint32_t* x2, uint32_t* y2) {

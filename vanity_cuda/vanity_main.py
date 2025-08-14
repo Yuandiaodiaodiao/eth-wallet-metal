@@ -53,18 +53,30 @@ class VanityAddressGenerator:
         Args:
             batch_size: Number of private keys to process
             steps_per_thread: Number of addresses to check per thread (walker mode)
-            target_pattern: Hex pattern to search for (e.g., "888" for 0x888...)
+            target_pattern: Pattern to search for. Formats:
+                           - "888" = head pattern only (0x888...)
+                           - ",abc" = tail pattern only (...abc)
+                           - "888,abc" = both head and tail (0x888...abc)
             use_walker: Use walker kernel for better performance
             
         Returns:
             Dictionary with results and statistics
         """
-        # Parse target pattern
-        if not all(c in "0123456789abcdef" for c in target_pattern.lower()):
-            raise ValueError(f"Invalid hex pattern: {target_pattern}")
+        # Parse target pattern (head,tail format)
+        if "," in target_pattern:
+            head_pattern, tail_pattern = target_pattern.split(",", 1)
+        else:
+            head_pattern = target_pattern
+            tail_pattern = ""
         
-        target_nibble = int(target_pattern[0], 16) if target_pattern else 0x8
-        nibble_count = len(target_pattern)
+        # Validate patterns
+        if head_pattern and not all(c in "0123456789abcdef" for c in head_pattern.lower()):
+            raise ValueError(f"Invalid head hex pattern: {head_pattern}")
+        if tail_pattern and not all(c in "0123456789abcdef" for c in tail_pattern.lower()):
+            raise ValueError(f"Invalid tail hex pattern: {tail_pattern}")
+        
+        if not head_pattern and not tail_pattern:
+            raise ValueError("At least one of head or tail pattern must be provided")
         
         # Generate private keys
         print(f"Generating {batch_size} private keys...")
@@ -75,20 +87,20 @@ class VanityAddressGenerator:
         # Run GPU kernel
         middle_gpu_time=0
         if use_walker:
-            print('use worker')
+            print('use walker')
             indices, gpu_time, middle_gpu_time = self.cuda_generator.generate_vanity_walker(
                 privkeys,
                 steps_per_thread=steps_per_thread,
-                target_nibble=target_nibble,
-                nibble_count=nibble_count
+                head_pattern=head_pattern,
+                tail_pattern=tail_pattern
             )
             addresses_checked = batch_size * steps_per_thread
             all_addresses = None  # Walker kernel doesn't support address output yet
         else:
             indices, gpu_time, all_addresses = self.cuda_generator.generate_vanity_simple(
                 privkeys,
-                target_nibble=target_nibble,
-                nibble_count=nibble_count
+                head_pattern=head_pattern,
+                tail_pattern=tail_pattern
             )
             addresses_checked = batch_size
         
@@ -138,7 +150,9 @@ class VanityAddressGenerator:
                     "private_key": base_key.hex(),
                     "key_index": key_idx,
                     "step": step,
-                    "pattern": f"0x{target_pattern}"
+                    "head_pattern": head_pattern if head_pattern else None,
+                    "tail_pattern": tail_pattern if tail_pattern else None,
+                    "pattern": target_pattern
                 })
         
         # Print addresses only when not using walker mode
@@ -168,7 +182,7 @@ class VanityAddressGenerator:
             steps_per_thread: Steps per thread for walker kernel
             save_interval: Save results every N matches
         """
-        print(f"Starting continuous generation for pattern 0x{target_pattern}")
+        print(f"Starting continuous generation for pattern: {target_pattern}")
         print(f"Batch size: {batch_size}, Steps per thread: {steps_per_thread}")
         print(f"Press Ctrl+C to stop\n")
         
@@ -241,7 +255,7 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "8888888"
+    pattern = "8888,8888"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
     batch_size = 4096*32
     steps = 512*8
     device = 0

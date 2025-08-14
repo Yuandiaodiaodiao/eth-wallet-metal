@@ -1,7 +1,6 @@
 #pragma once
 
 #include "constants.cuh"
-#include <cuda_runtime.h>
 
 // 256-bit integer addition (returns carry) - internal helper
 __device__ __forceinline__ uint32_t add(uint32_t* r, const uint32_t* a, const uint32_t* b) {

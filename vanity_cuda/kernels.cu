@@ -1,5 +1,4 @@
 // CUDA runtime
-#include <cuda_runtime.h>
 
 // Secp256k1 elliptic curve implementation
 #include "include/secp256k1.cuh"
@@ -20,8 +19,10 @@ extern "C" __global__ void vanity_kernel_g16(
     uint8_t* __restrict__ outbuffer,           // Output: addresses for each privkey (20 bytes each)
     const uint8_t* __restrict__ g16_table,     // G16 precomputed table
     uint32_t num_keys,                         // Number of keys to process
-    uint8_t target_nibble,                     // Target nibble value (0x0 - 0xF)
-    uint32_t nibble_count)                     // Number of nibbles to match
+    const uint8_t* __restrict__ head_pattern,  // Head pattern (packed nibbles as bytes)
+    uint32_t head_nibbles,                     // Number of head nibbles to match
+    const uint8_t* __restrict__ tail_pattern,  // Tail pattern (packed nibbles as bytes)
+    uint32_t tail_nibbles)                     // Number of tail nibbles to match
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= num_keys) return;
@@ -85,7 +86,7 @@ extern "C" __global__ void vanity_kernel_g16(
     // }
     
     // Check vanity pattern
-    if (check_vanity(addr, target_nibble, nibble_count)) {
+    if (check_vanity_pattern(addr, head_pattern, head_nibbles, tail_pattern, tail_nibbles)) {
         atomicAdd(found_count, 1);
         found_indices[0] = gid;
     }
@@ -137,8 +138,10 @@ extern "C" __global__ void vanity_walker_kernel(
     uint32_t* __restrict__ found_count,        // Output count
     uint32_t num_keys,
     uint32_t steps_per_thread,
-    uint8_t target_nibble,
-    uint32_t nibble_count)
+    const uint8_t* __restrict__ head_pattern,  // Head pattern (packed nibbles as bytes)
+    uint32_t head_nibbles,                     // Number of head nibbles to match
+    const uint8_t* __restrict__ tail_pattern,  // Tail pattern (packed nibbles as bytes)
+    uint32_t tail_nibbles)                     // Number of tail nibbles to match
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= num_keys) return;
@@ -263,7 +266,7 @@ extern "C" __global__ void vanity_walker_kernel(
             
         
 
-            if (check_vanity(addr, target_nibble, nibble_count)) {
+            if (check_vanity_pattern(addr, head_pattern, head_nibbles, tail_pattern, tail_nibbles)) {
                 atomicAdd(found_count, 1);
                 found_indices[0] = gid * steps_per_thread + processed + (uint32_t)ii;
             }

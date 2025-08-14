@@ -2,7 +2,6 @@
 
 #include "constants.cuh"
 #include "ec_ops.cuh"
-#include <cuda_runtime.h>
 
 // G16 precomputed table structure (in constant memory)
 struct G16Table {

@@ -2,7 +2,6 @@
 #define KECCAK256_CUH
 
 #include "math_utils.cuh"
-#include <cuda_runtime.h>
 
 // Keccak-256 round constants
 __constant__ uint64_t KECCAK_RC[24] = {
@@ -212,6 +211,68 @@ __device__ __forceinline__ bool check_vanity(const uint8_t* addr20, uint8_t nibb
     if (has_half) {
         if ((addr20[full_bytes] >> 4) != nibble) {
             return false;
+        }
+    }
+    
+    return true;
+}
+
+// Check if address matches head and/or tail patterns
+__device__ __forceinline__ bool check_vanity_pattern(
+    const uint8_t* addr20,
+    const uint8_t* head_pattern, uint32_t head_nibbles,
+    const uint8_t* tail_pattern, uint32_t tail_nibbles) {
+    
+    // Check head pattern if provided
+    if (head_nibbles > 0 && head_pattern) {
+        uint32_t full_bytes = head_nibbles >> 1;
+        uint32_t has_half = head_nibbles & 1;
+        
+        // Check full bytes
+        for (uint32_t i = 0; i < full_bytes; i++) {
+            if (addr20[i] != head_pattern[i]) {
+                return false;
+            }
+        }
+        
+        // Check half byte if needed
+        if (has_half) {
+            uint8_t addr_nibble = (addr20[full_bytes] >> 4) & 0xF;
+            uint8_t pattern_nibble = (head_pattern[full_bytes] >> 4) & 0xF;
+            if (addr_nibble != pattern_nibble) {
+                return false;
+            }
+        }
+    }
+    
+    // Check tail pattern if provided
+    if (tail_nibbles > 0 && tail_pattern) {
+        uint32_t full_bytes = tail_nibbles >> 1;
+        uint32_t has_half = tail_nibbles & 1;
+        
+        // Calculate starting position from the end
+        uint32_t start_pos;
+        if (has_half) {
+            start_pos = 20 - full_bytes - 1;
+        } else {
+            start_pos = 20 - full_bytes;
+        }
+        
+        // Check half byte first if needed (from the end)
+        if (has_half) {
+            uint8_t addr_nibble = addr20[19] & 0xF;
+            uint8_t pattern_nibble = tail_pattern[full_bytes] & 0xF;
+            if (addr_nibble != pattern_nibble) {
+                return false;
+            }
+        }
+        
+        // Check full bytes from the end
+        for (uint32_t i = 0; i < full_bytes; i++) {
+            uint32_t addr_pos = start_pos + i + (has_half ? 1 : 0);
+            if (addr20[addr_pos] != tail_pattern[i]) {
+                return false;
+            }
         }
     }
     
