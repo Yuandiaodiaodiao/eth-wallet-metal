@@ -10,7 +10,7 @@ def hex_addr(b: bytes) -> str:
 
 
 
-def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_thread: int = 256*16, prefix_hex: Optional[str] = "000000", suffix_hex: Optional[str] = "000000") -> None:
+def main(batch_size: int = 1, max_batches: Optional[int] = None, steps_per_thread: int = 1, prefix_hex: Optional[str] = None, suffix_hex: Optional[str] = None) -> None:
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vanity")
     engine = MetalVanity(here)
     batches = 0
@@ -21,12 +21,25 @@ def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_t
     # Initialize first three buffers
     t_gen0 = time.perf_counter()
     privs_0 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
+    privs_0 = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
     gen_0_sec = time.perf_counter() - t_gen0
+    # Debug: dump ETH addresses (last 20 bytes) for batch 0
+    addrs0 = engine.compute_eth_addresses(privs_0)
+    print("addresses batch0:")
+    for k, addr in zip(privs_0, addrs0):
+        print(f"{k.hex()}: {hex_addr(addr)}")
     job_0 = engine.encode_and_commit_walk_compact(privs_0, steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
     
     t_gen1 = time.perf_counter()
     privs_1 = generate_valid_privkeys(batch_size, steps_per_thread, 128)
+    privs_1 = [bytes.fromhex("801b58f6029d6514ac85f20db88f919b4b26fc3b72128c379cd7f7f790974c61")]
+
     gen_1_sec = time.perf_counter() - t_gen1
+    # Debug: dump ETH addresses (last 20 bytes) for batch 1
+    addrs1 = engine.compute_eth_addresses(privs_1)
+    print("addresses batch1:")
+    for k, addr in zip(privs_1, addrs1):
+        print(f"{k.hex()}: {hex_addr(addr)}")
     job_1 = engine.encode_and_commit_walk_compact(privs_1, steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
     
     # Circular buffer indices
@@ -96,6 +109,11 @@ def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_t
         t_gen = time.perf_counter()
         privs[oldest_idx] = generate_valid_privkeys(batch_size, steps_per_thread, 128)
         gen_times[oldest_idx] = time.perf_counter() - t_gen
+        # Debug: dump ETH addresses for new batch
+        addrs_dbg = engine.compute_eth_addresses(privs[oldest_idx])
+        print(f"addresses batch{batches+1}:")
+        for k, addr in zip(privs[oldest_idx], addrs_dbg):
+            print(f"{k.hex()}: {hex_addr(addr)}")
         jobs[oldest_idx] = engine.encode_and_commit_walk_compact(privs[oldest_idx], steps_per_thread=steps_per_thread, prefix_hex=prefix_hex, suffix_hex=suffix_hex)
         
         # Move to next buffer in circular fashion

@@ -241,6 +241,28 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         if (ok) { uint idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed); index_compact_out[0] = gid; }
     }
 
+        // Dump last 20 bytes (Ethereum address) for each privkey
+        KERNEL_FQ void vanity_kernel_w16_dumpaddr(
+            device const uchar *priv_in                  [[ buffer(0) ]],
+            device uchar *addr_out                       [[ buffer(1) ]],
+            device const uchar *g16_table                [[ buffer(2) ]],
+            uint gid                                     [[ thread_position_in_grid ]])
+        {
+            const device uchar *p = priv_in + gid * 32;
+            device uchar *dst = addr_out + gid * 20;
+
+            u32 k_be[8]; for (ushort i=0;i<8;++i){ ushort off=i*4; u32 w=((u32)p[off]<<24)|((u32)p[off+1]<<16)|((u32)p[off+2]<<8)|((u32)p[off+3]); k_be[i]=w; }
+            u32 k_local[8]; k_local[7]=k_be[0]; k_local[6]=k_be[1]; k_local[5]=k_be[2]; k_local[4]=k_be[3]; k_local[3]=k_be[4]; k_local[2]=k_be[5]; k_local[1]=k_be[6]; k_local[0]=k_be[7];
+            u32 x[8]; u32 y[8]; 
+            for (ushort i=0;i<8;++i){ dst[i] = k_local[i]; }
+            point_mul_xy_w16(x, y, k_local, g16_table);
+            uchar pub[64];
+            for (ushort i=0;i<8;++i){ u32 w=x[7-i]; ushort off=i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+            for (ushort i=0;i<8;++i){ u32 w=y[7-i]; ushort off=32+i*4; pub[off]=w>>24; pub[off+1]=w>>16; pub[off+2]=w>>8; pub[off+3]=w; }
+            uchar digest[32]; keccak256_64(pub, digest);
+            
+        }
+
     // --- Builder for g16 table ---
     struct G16Params { uint win; uint start; };
 
@@ -445,6 +467,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         # Try to compile w16 kernels
         self.pipeline_w16_compact = None
         fn_w16c = library.newFunctionWithName_("vanity_kernel_w16_compact")
+        fn_w16dump = library.newFunctionWithName_("vanity_kernel_w16_dumpaddr")
         fn_builder = library.newFunctionWithName_("g16_builder_kernel")
         fn_compute_base_w16 = library.newFunctionWithName_("vanity_kernel_compute_basepoint_w16")
         fn_walk = library.newFunctionWithName_("vanity_kernel_walk_compact")
@@ -452,6 +475,11 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
             p_w16c, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16c, None)
             if p_w16c is not None:
                 self.pipeline_w16_compact = p_w16c
+        self.pipeline_w16_dumpaddr = None
+        if fn_w16dump is not None:
+            p_w16d, error = self.device.newComputePipelineStateWithFunction_error_(fn_w16dump, None)
+            if p_w16d is not None:
+                self.pipeline_w16_dumpaddr = p_w16d
         self.pipeline_builder = None
       
 
@@ -813,3 +841,35 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         cb.commit()
         job.cpu_encode_seconds = time.perf_counter() - t_cpu0
         return job
+
+    def compute_eth_addresses(self, privkeys_be32: List[bytes]) -> List[bytes]:
+        if not privkeys_be32:
+            return []
+        for i, k in enumerate(privkeys_be32):
+            if len(k) != 32:
+                raise ValueError(f"privkey[{i}] must be 32 bytes")
+        count = len(privkeys_be32)
+        in_size = 32 * count
+        out_size = 20 * count
+        in_buffer = self.device.newBufferWithLength_options_(in_size, 0)
+        out_buffer = self.device.newBufferWithLength_options_(out_size, 0)
+        in_mv = in_buffer.contents().as_buffer(in_size)
+        for i, k in enumerate(privkeys_be32):
+            off = i * 32
+            in_mv[off : off + 32] = k
+        cb = self.queue.commandBuffer()
+        enc = cb.computeCommandEncoder()
+        enc.setComputePipelineState_(self.pipeline_w16_dumpaddr)
+        enc.setBuffer_offset_atIndex_(in_buffer, 0, 0)
+        enc.setBuffer_offset_atIndex_(out_buffer, 0, 1)
+        enc.setBuffer_offset_atIndex_(self.g16_buffer, 0, 2)
+        w = int(self.thread_execution_width) or 16
+        tpt = min(256, max(w * 4, w), max(1, count))
+        tg = MTLSizeMake(tpt, 1, 1)
+        grid = MTLSizeMake(count, 1, 1)
+        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        out = bytes(out_buffer.contents().as_buffer(out_size)[:out_size])
+        return [out[i*20:(i+1)*20] for i in range(count)]
