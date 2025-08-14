@@ -2,12 +2,12 @@
 cuda-python>=12.0.0
 
 # CuPy for CUDA array operations
-cupy-cuda12x>=13.0.0  # Use appropriate version for your CUDA version
+cupy-cuda12x>=13.0.0
 
 # NumPy for CPU array operations
 numpy>=1.24.0
 
-# Optional: for performance monitoring
-pynvml>=11.5.0
+# Cryptography library for secp256k1
+ecdsa
 
 
