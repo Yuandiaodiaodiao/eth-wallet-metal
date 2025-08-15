@@ -496,7 +496,7 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "000000,000000"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
+    pattern = "******,******"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
     batch_size = 4096*32
     steps = 512*8
     device = 0

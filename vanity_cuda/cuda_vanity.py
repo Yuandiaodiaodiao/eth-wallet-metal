@@ -180,60 +180,153 @@ class CudaVanity:
         self.stream_g16.sync()
         return g16_table
     
+    def _get_nibble_access(self, byte_idx: int, is_high_nibble: bool) -> str:
+        """Generate C expression to access a nibble"""
+        if is_high_nibble:
+            return f"(addr[{byte_idx}] >> 4)"
+        else:
+            return f"(addr[{byte_idx}] & 0xF)"
+    
+    def _parse_pattern_segments(self, pattern: str, is_tail: bool = False):
+        """Parse pattern into segments of wildcards and literals
+        
+        Returns:
+            List of tuples (type, value, global_nibble_positions)
+            where type is 'wildcard' or 'literal'
+        """
+        if not pattern:
+            return []
+        
+        segments = []
+        current_segment = {'type': None, 'chars': [], 'start_pos': None}
+        
+        for i, char in enumerate(pattern):
+            if char == '*':
+                if current_segment['type'] == 'literal':
+                    # End current literal segment
+                    segments.append(('literal', ''.join(current_segment['chars']), current_segment['start_pos']))
+                    current_segment = {'type': 'wildcard', 'chars': [char], 'start_pos': i}
+                else:
+                    # Continue or start wildcard segment
+                    current_segment['type'] = 'wildcard'
+                    current_segment['chars'].append(char)
+                    if 'start_pos' not in current_segment or current_segment['start_pos'] is None:
+                        current_segment['start_pos'] = i
+            else:
+                if current_segment['type'] == 'wildcard':
+                    # End current wildcard segment
+                    segments.append(('wildcard', ''.join(current_segment['chars']), current_segment['start_pos']))
+                    current_segment = {'type': 'literal', 'chars': [char], 'start_pos': i}
+                else:
+                    # Continue or start literal segment
+                    current_segment['type'] = 'literal'
+                    current_segment['chars'].append(char)
+                    if 'start_pos' not in current_segment or current_segment['start_pos'] is None:
+                        current_segment['start_pos'] = i
+        
+        # Add final segment
+        if current_segment['chars']:
+            segments.append((current_segment['type'], ''.join(current_segment['chars']), current_segment['start_pos']))
+        
+        # Convert to global nibble positions
+        result = []
+        for seg_type, value, start_pos in segments:
+            if is_tail:
+                # For tail pattern, calculate positions from the end
+                # Tail patterns are positioned from the right side of the address
+                global_positions = []
+                for i in range(len(value)):
+                    nibble_from_end = len(pattern) - start_pos - i - 1
+                    global_nibble_idx = 40 - 1 - nibble_from_end  # 40 nibbles total (20 bytes * 2)
+                    
+                    # Safety check to prevent out-of-bounds access
+                    if global_nibble_idx < 0 or global_nibble_idx >= 40:
+                        raise ValueError(f"Invalid global nibble index {global_nibble_idx} for pattern '{pattern}' "
+                                       f"at segment start_pos={start_pos}, char {i}. "
+                                       f"nibble_from_end={nibble_from_end}")
+                    
+                    global_positions.append(global_nibble_idx)
+            else:
+                # For head pattern, positions start from 0
+                global_positions = list(range(start_pos, start_pos + len(value)))
+            
+            result.append((seg_type, value, global_positions))
+        
+        return result
+    
     def _generate_pattern_macros(self, head_pattern: str, tail_pattern: str) -> str:
-        """Generate compile-time macros for pattern matching"""
+        """Generate compile-time macros for pattern matching with wildcard support"""
         macros = []
         
-        if head_pattern:
-            # Generate head pattern macro
-            checks = []
-            for i in range(0, len(head_pattern), 2):
-                byte_idx = i // 2
-                if i + 1 < len(head_pattern):
-                    # Complete byte
-                    byte_val = (int(head_pattern[i], 16) << 4) | int(head_pattern[i+1], 16)
-                    checks.append(f"(addr[{byte_idx}] == 0x{byte_val:02x})")
-                else:
-                    # Half byte (only upper nibble)
-                    nibble = int(head_pattern[i], 16)
-                    checks.append(f"((addr[{byte_idx}] >> 4) == 0x{nibble:x})")
-            
-            macro = f"#define CHECK_HEAD_PATTERN(addr) ({' && '.join(checks)})"
-            macros.append(macro)
-        else:
-            macros.append("#define CHECK_HEAD_PATTERN(addr) (true)")
+        # Parse both patterns to identify wildcards and literals
+        head_segments = self._parse_pattern_segments(head_pattern, is_tail=False)
+        tail_segments = self._parse_pattern_segments(tail_pattern, is_tail=True)
         
-        if tail_pattern:
-            # Generate tail pattern macro
-            checks = []
-            pattern_len = len(tail_pattern)
-            full_bytes = pattern_len // 2
-            has_half = pattern_len % 2
-            
-            # Check from the end of address (byte 19, 18, 17, ...)
-            if has_half:
-                # Last nibble (rightmost)
-                nibble = int(tail_pattern[-1], 16)
-                checks.append(f"((addr[19] & 0xF) == 0x{nibble:x})")
-                remaining_pattern = tail_pattern[:-1]
+        # Collect all wildcard positions globally
+        wildcard_positions = []
+        literal_checks = []
+        
+        # Process head pattern segments
+        for seg_type, value, positions in head_segments:
+            if seg_type == 'wildcard':
+                wildcard_positions.extend(positions)
             else:
-                remaining_pattern = tail_pattern
+                # Generate literal checks for head
+                for i, char in enumerate(value):
+                    nibble_idx = positions[i]
+                    byte_idx = nibble_idx // 2
+                    is_high = (nibble_idx % 2) == 0
+                    nibble_val = int(char, 16)
+                    
+                    access_expr = self._get_nibble_access(byte_idx, is_high)
+                    literal_checks.append(f"({access_expr} == 0x{nibble_val:x})")
+        
+        # Process tail pattern segments
+        for seg_type, value, positions in tail_segments:
+            if seg_type == 'wildcard':
+                wildcard_positions.extend(positions)
+            else:
+                # Generate literal checks for tail
+                for i, char in enumerate(value):
+                    nibble_idx = positions[i]
+                    byte_idx = nibble_idx // 2
+                    is_high = (nibble_idx % 2) == 0
+                    nibble_val = int(char, 16)
+                    
+                    access_expr = self._get_nibble_access(byte_idx, is_high)
+                    literal_checks.append(f"({access_expr} == 0x{nibble_val:x})")
+        
+        # Generate wildcard matching checks
+        wildcard_checks = []
+        if wildcard_positions:
+            # Use first wildcard position as reference
+            ref_nibble_idx = wildcard_positions[0]
+            ref_byte_idx = ref_nibble_idx // 2
+            ref_is_high = (ref_nibble_idx % 2) == 0
+            reference_expr = self._get_nibble_access(ref_byte_idx, ref_is_high)
             
-            # Check full bytes from right to left
-            byte_pos = 19 - (1 if has_half else 0)
-            for i in range(0, len(remaining_pattern), 2):
-                if i + 1 < len(remaining_pattern):
-                    # Two nibbles forming a complete byte
-                    high_nibble = int(remaining_pattern[-(i+2)], 16)  # Read from end
-                    low_nibble = int(remaining_pattern[-(i+1)], 16)
-                    byte_val = (high_nibble << 4) | low_nibble
-                    checks.append(f"(addr[{byte_pos}] == 0x{byte_val:02x})")
-                    byte_pos -= 1
-            
-            macro = f"#define CHECK_TAIL_PATTERN(addr) ({' && '.join(checks)})"
-            macros.append(macro)
+            # Compare all other wildcard positions to the reference
+            for nibble_idx in wildcard_positions[1:]:
+                byte_idx = nibble_idx // 2
+                is_high = (nibble_idx % 2) == 0
+                access_expr = self._get_nibble_access(byte_idx, is_high)
+                wildcard_checks.append(f"({reference_expr} == {access_expr})")
+        
+        # Combine all checks
+        all_checks = wildcard_checks + literal_checks
+        
+        if all_checks:
+            # Split checks between head and tail macros for clarity
+            # For now, put all checks in head macro and make tail macro always true
+            head_macro = f"#define CHECK_HEAD_PATTERN(addr) ({' && '.join(all_checks)})"
+            tail_macro = "#define CHECK_TAIL_PATTERN(addr) (true)"
         else:
-            macros.append("#define CHECK_TAIL_PATTERN(addr) (true)")
+            # No patterns specified
+            head_macro = "#define CHECK_HEAD_PATTERN(addr) (true)"
+            tail_macro = "#define CHECK_TAIL_PATTERN(addr) (true)"
+        
+        macros.append(head_macro)
+        macros.append(tail_macro)
         
         return '\n'.join(macros)
     
@@ -319,7 +412,10 @@ class CudaVanity:
             print(f"  {line}")
         
         # Debug: save optimized source to file for inspection
-        debug_path = kernel_dir / f"debug_optimized_{head_pattern}_{tail_pattern}.cu"
+        # Escape special characters in pattern strings for safe filename
+        safe_head = head_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if head_pattern else 'EMPTY'
+        safe_tail = tail_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if tail_pattern else 'EMPTY'
+        debug_path = kernel_dir / f"debug_optimized_{safe_head}_{safe_tail}.cu"
         with open(debug_path, "w") as f:
             f.write(optimized_source)
         print(f"Debug: Saved optimized source to {debug_path}")
@@ -344,10 +440,15 @@ class CudaVanity:
         print(f"Generating {len(privkeys)} private keys...")
         num_keys = len(privkeys)
         
-        # Convert pattern strings to byte arrays
+        # Convert pattern strings to byte arrays (only for non-wildcard patterns)
         def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
             if not pattern:
                 return cp.zeros(0, dtype=cp.uint8), 0
+            
+            # Check if pattern contains wildcards
+            if '*' in pattern:
+                # For wildcard patterns, we use optimized kernels that don't need pattern bytes
+                return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
             
             pattern = pattern.lower()
             nibble_count = len(pattern)
@@ -454,10 +555,15 @@ class CudaVanity:
             kernel_compute_base = self.kernel_compute_base
             kernel_walker = self.kernel_walker
         
-        # Convert pattern strings to byte arrays
+        # Convert pattern strings to byte arrays (only for non-wildcard patterns)
         def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
             if not pattern:
                 return cp.zeros(0, dtype=cp.uint8), 0
+            
+            # Check if pattern contains wildcards
+            if '*' in pattern:
+                # For wildcard patterns, we use optimized kernels that don't need pattern bytes
+                return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
             
             pattern = pattern.lower()
             nibble_count = len(pattern)
@@ -598,10 +704,15 @@ class CudaVanity:
             kernel_walker = self.kernel_walker
             print("Using default kernels (no pattern optimization)")
         
-        # Convert pattern strings to byte arrays (same as sync version)
+        # Convert pattern strings to byte arrays (only for non-wildcard patterns)
         def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
             if not pattern:
                 return cp.zeros(0, dtype=cp.uint8), 0
+            
+            # Check if pattern contains wildcards
+            if '*' in pattern:
+                # For wildcard patterns, we use optimized kernels that don't need pattern bytes
+                return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
             
             pattern = pattern.lower()
             nibble_count = len(pattern)

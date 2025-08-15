@@ -5,7 +5,7 @@
 #include "include/keccak256.cuh"
 
 // Pattern optimization macros
-#define CHECK_HEAD_PATTERN(addr) (((addr[0] >> 4) == 0x8))
+#define CHECK_HEAD_PATTERN(addr) (((addr[0] >> 4) == (addr[0] & 0xF)) && ((addr[0] >> 4) == (addr[1] >> 4)) && ((addr[0] >> 4) == (addr[1] & 0xF)) && ((addr[0] >> 4) == (addr[18] >> 4)) && ((addr[0] >> 4) == (addr[18] & 0xF)) && ((addr[0] >> 4) == (addr[19] >> 4)) && ((addr[0] >> 4) == (addr[19] & 0xF)))
 #define CHECK_TAIL_PATTERN(addr) (true)
 #define USE_PATTERN_OPTIMIZATION
 
