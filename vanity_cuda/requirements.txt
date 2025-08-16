@@ -11,6 +11,6 @@ numpy>=1.24.0
 ecdsa
 
 # CUDA core library
-cuda-core[cu12]
+cuda-core==0.3.2
 
 
