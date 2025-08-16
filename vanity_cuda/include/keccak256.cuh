@@ -192,18 +192,32 @@ __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* 
     // Apply Keccak-f[1600]
     keccak_f1600(state);
     
-    // Extract last 20 bytes directly from state (bytes 12-31 of hash)
-    uint8_t hash[32];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        store64_le(hash + i * 8, state[i]);
-    }
+    // Extract last 20 bytes directly from state using optimized operations
+    // Original: hash[0-7]=state[0], hash[8-15]=state[1], hash[16-23]=state[2], hash[24-31]=state[3]
+    // Need: addr20[0-19] = hash[12-31]
+    // addr20[0-3] = hash[12-15] (state[1] upper 4 bytes)
+    // addr20[4-11] = hash[16-23] (state[2] all 8 bytes)  
+    // addr20[12-19] = hash[24-31] (state[3] all 8 bytes)
     
-    // Copy last 20 bytes
-    #pragma unroll
-    for (int i = 0; i < 20; i++) {
-        addr20[i] = hash[12 + i];
-    }
+    uint64_t temp1, temp2, temp3;
+    
+    asm volatile (
+        // Extract upper 4 bytes from state[1] (hash[12-15])
+        "mov.b64    %0, %3;\n\t"
+        "shr.u64    %0, %0, 32;\n\t"
+        
+        // Load state[2] and state[3] directly
+        "mov.b64    %1, %4;\n\t"
+        "mov.b64    %2, %5;"
+        
+        : "=l"(temp1), "=l"(temp2), "=l"(temp3)
+        : "l"(state[1]), "l"(state[2]), "l"(state[3])
+    );
+    
+    // Store using correct address offsets
+    *(uint32_t*)addr20 = (uint32_t)temp1;           // addr20[0-3]
+    *(uint64_t*)(addr20+4) = temp2;                 // addr20[4-11]
+    *(uint64_t*)(addr20+12) = temp3;                // addr20[12-19]
 }
 
 // Check if address matches vanity pattern
