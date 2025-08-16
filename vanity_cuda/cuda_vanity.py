@@ -310,8 +310,10 @@ class CudaVanity:
         # Process other full-byte wildcards - optimized approach
         for byte_idx in full_byte_wildcards:
             if byte_idx != ref_byte_idx:
-                # For full bytes, we only need to compare the whole byte to reference
-                # No need for internal consistency check since equality with reference implies consistency
+                # For full bytes, we need both:
+                # 1. Internal consistency check (high nibble == low nibble)
+                # 2. Equality with reference byte
+                optimized_checks.append(f"((addr[{byte_idx}] >> 4) == (addr[{byte_idx}] & 0xF))")
                 optimized_checks.append(f"(addr[{byte_idx}] == addr[{ref_byte_idx}])")
         
         # Process remaining partial wildcards
