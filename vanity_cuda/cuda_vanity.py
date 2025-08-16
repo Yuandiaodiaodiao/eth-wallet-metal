@@ -187,6 +187,143 @@ class CudaVanity:
         else:
             return f"(addr[{byte_idx}] & 0xF)"
     
+    def _optimize_literal_checks(self, literal_checks: List[str]) -> List[str]:
+        """Optimize literal checks by merging adjacent nibble checks for the same byte"""
+        if not literal_checks:
+            return literal_checks
+        
+        # Parse checks to extract byte index, nibble position, and value
+        check_info = []
+        for check in literal_checks:
+            # Parse patterns like "((addr[0] >> 4) == 0x1)" or "((addr[0] & 0xF) == 0x2)"
+            import re
+            high_match = re.match(r'\(\(addr\[(\d+)\] >> 4\) == 0x([0-9a-fA-F])\)', check)
+            low_match = re.match(r'\(\(addr\[(\d+)\] & 0xF\) == 0x([0-9a-fA-F])\)', check)
+            
+            if high_match:
+                byte_idx = int(high_match.group(1))
+                value = int(high_match.group(2), 16)
+                check_info.append((byte_idx, 'high', value, check))
+            elif low_match:
+                byte_idx = int(low_match.group(1))
+                value = int(low_match.group(2), 16)
+                check_info.append((byte_idx, 'low', value, check))
+            else:
+                # Keep unknown formats as-is
+                check_info.append((None, None, None, check))
+        
+        # Group by byte index and try to merge
+        byte_groups = {}
+        standalone_checks = []
+        
+        for byte_idx, nibble_pos, value, original_check in check_info:
+            if byte_idx is not None:
+                if byte_idx not in byte_groups:
+                    byte_groups[byte_idx] = {}
+                byte_groups[byte_idx][nibble_pos] = (value, original_check)
+            else:
+                # Keep non-parseable checks as-is
+                standalone_checks.append(original_check)
+        
+        # Merge checks for bytes that have both high and low nibbles
+        optimized_checks = []
+        
+        for byte_idx in sorted(byte_groups.keys()):
+            group = byte_groups[byte_idx]
+            
+            if 'high' in group and 'low' in group:
+                # Both nibbles present - merge into single byte check
+                high_val, _ = group['high']
+                low_val, _ = group['low']
+                merged_val = (high_val << 4) | low_val
+                optimized_check = f"(addr[{byte_idx}] == 0x{merged_val:02x})"
+                optimized_checks.append(optimized_check)
+            else:
+                # Only one nibble - keep original checks
+                if 'high' in group:
+                    _, original_check = group['high']
+                    optimized_checks.append(original_check)
+                if 'low' in group:
+                    _, original_check = group['low']
+                    optimized_checks.append(original_check)
+        
+        # Add standalone checks
+        optimized_checks.extend(standalone_checks)
+        
+        return optimized_checks
+    
+    def _optimize_wildcard_checks(self, wildcard_positions: List[int]) -> List[str]:
+        """Optimize wildcard checks by merging adjacent wildcards for the same byte"""
+        if not wildcard_positions:
+            return []
+        
+        # Group wildcard positions by byte and analyze patterns
+        byte_wildcards = {}
+        for nibble_idx in wildcard_positions:
+            byte_idx = nibble_idx // 2
+            is_high = (nibble_idx % 2) == 0
+            if byte_idx not in byte_wildcards:
+                byte_wildcards[byte_idx] = {}
+            byte_wildcards[byte_idx][nibble_idx] = is_high
+        
+        # Find consecutive full-byte wildcards (both high and low nibbles present)
+        full_byte_wildcards = []
+        partial_nibbles = []
+        
+        for byte_idx in sorted(byte_wildcards.keys()):
+            nibbles_in_byte = byte_wildcards[byte_idx]
+            
+            # Check if this byte has both high and low nibbles as wildcards
+            expected_high = byte_idx * 2
+            expected_low = byte_idx * 2 + 1
+            
+            if expected_high in nibbles_in_byte and expected_low in nibbles_in_byte:
+                full_byte_wildcards.append(byte_idx)
+            else:
+                # Add individual nibbles for partial bytes
+                for nibble_idx in nibbles_in_byte:
+                    partial_nibbles.append(nibble_idx)
+        
+        # Generate optimized checks
+        optimized_checks = []
+        
+        if not wildcard_positions:
+            return optimized_checks
+        
+        # Choose reference: prefer partial nibbles first, then full bytes
+        if partial_nibbles:
+            ref_nibble_idx = partial_nibbles[0]
+            ref_byte_idx = ref_nibble_idx // 2
+        elif full_byte_wildcards:
+            ref_byte_idx = full_byte_wildcards[0] 
+            ref_nibble_idx = ref_byte_idx * 2  # Use high nibble as reference
+        else:
+            return optimized_checks
+        
+        ref_is_high = (ref_nibble_idx % 2) == 0
+        reference_expr = self._get_nibble_access(ref_byte_idx, ref_is_high)
+        
+        # If reference byte is a full wildcard, ensure its nibbles are equal
+        if ref_byte_idx in full_byte_wildcards:
+            optimized_checks.append(f"({reference_expr} == (addr[{ref_byte_idx}] & 0xF))")
+        
+        # Process other full-byte wildcards - optimized approach
+        for byte_idx in full_byte_wildcards:
+            if byte_idx != ref_byte_idx:
+                # For full bytes, we only need to compare the whole byte to reference
+                # No need for internal consistency check since equality with reference implies consistency
+                optimized_checks.append(f"(addr[{byte_idx}] == addr[{ref_byte_idx}])")
+        
+        # Process remaining partial wildcards
+        for nibble_idx in partial_nibbles:
+            if nibble_idx != ref_nibble_idx:  # Skip reference nibble
+                byte_idx = nibble_idx // 2
+                is_high = (nibble_idx % 2) == 0
+                access_expr = self._get_nibble_access(byte_idx, is_high)
+                optimized_checks.append(f"({reference_expr} == {access_expr})")
+        
+        return optimized_checks
+    
     def _parse_pattern_segments(self, pattern: str, is_tail: bool = False):
         """Parse pattern into segments of wildcards and literals
         
@@ -296,24 +433,14 @@ class CudaVanity:
                     access_expr = self._get_nibble_access(byte_idx, is_high)
                     literal_checks.append(f"({access_expr} == 0x{nibble_val:x})")
         
-        # Generate wildcard matching checks
-        wildcard_checks = []
-        if wildcard_positions:
-            # Use first wildcard position as reference
-            ref_nibble_idx = wildcard_positions[0]
-            ref_byte_idx = ref_nibble_idx // 2
-            ref_is_high = (ref_nibble_idx % 2) == 0
-            reference_expr = self._get_nibble_access(ref_byte_idx, ref_is_high)
-            
-            # Compare all other wildcard positions to the reference
-            for nibble_idx in wildcard_positions[1:]:
-                byte_idx = nibble_idx // 2
-                is_high = (nibble_idx % 2) == 0
-                access_expr = self._get_nibble_access(byte_idx, is_high)
-                wildcard_checks.append(f"({reference_expr} == {access_expr})")
+        # Generate optimized wildcard matching checks
+        wildcard_checks = self._optimize_wildcard_checks(wildcard_positions)
+        
+        # Optimize literal checks by merging adjacent nibble checks
+        optimized_literal_checks = self._optimize_literal_checks(literal_checks)
         
         # Combine all checks
-        all_checks = wildcard_checks + literal_checks
+        all_checks = wildcard_checks + optimized_literal_checks
         
         if all_checks:
             # Split checks between head and tail macros for clarity
