@@ -124,8 +124,8 @@ extern "C" __global__ void compute_basepoints_g16(
      
     // Compute base point
     uint32_t x[8], y[8];
-    // point_mul_g16(x, y, k, g16_table);
-    point_mul_xy(x, y, k_local, &G_PRECOMP);
+    point_mul_g16(x, y, k_local, g16_table);
+    // point_mul_xy(x, y, k_local, &G_PRECOMP);
     // Store result
     uint32_t* out = basepoints + gid * 16;
     #pragma unroll
