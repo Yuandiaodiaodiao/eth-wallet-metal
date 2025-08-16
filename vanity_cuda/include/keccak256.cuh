@@ -134,58 +134,36 @@ __device__ __forceinline__ void keccak256_64(const uint8_t* input, uint8_t* outp
     }
 }
 
-// Generic Keccak-256 (for arbitrary length input)
-__device__ void keccak256(const uint8_t* input, uint64_t len, uint8_t* output) {
-    uint64_t state[25];
-    const uint64_t rate = 136; // Rate for Keccak-256 (1088 bits / 8)
-    
-    // Initialize state
-    #pragma unroll
-    for (int i = 0; i < 25; i++) {
-        state[i] = 0;
-    }
-    
-    // Absorb input
-    uint64_t absorbed = 0;
-    while (absorbed < len) {
-        uint64_t to_absorb = (rate < len - absorbed) ? rate : len - absorbed;
-        
-        // Absorb block
-        for (uint64_t i = 0; i < to_absorb; i += 8) {
-            uint64_t bytes = (to_absorb - i < 8) ? to_absorb - i : 8;
-            uint64_t word = 0;
-            for (uint64_t j = 0; j < bytes; j++) {
-                word |= ((uint64_t)input[absorbed + i + j]) << (8 * j);
-            }
-            state[i / 8] ^= word;
-        }
-        
-        absorbed += to_absorb;
-        
-        if (to_absorb == rate) {
-            keccak_f1600(state);
-        }
-    }
-    
-    // Padding
-    uint64_t pad_pos = absorbed % rate;
-    state[pad_pos / 8] ^= 0x01ULL << ((pad_pos % 8) * 8);
-    state[(rate - 1) / 8] ^= 0x8000000000000000ULL;
-    
-    // Final permutation
-    keccak_f1600(state);
-    
-    // Squeeze output
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        store64_le(output + i * 8, state[i]);
-    }
-}
 
-// Compute Ethereum address from public key (last 20 bytes of Keccak-256)
-__device__ __forceinline__ void eth_address(const uint8_t* pubkey64, uint8_t* addr20) {
+
+// Compute Ethereum address from affine coordinates (last 20 bytes of Keccak-256)
+__device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* ya, uint8_t* addr20) {
+    uint8_t pub[64];
+    
+    // Pack x coordinates (big-endian)
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        uint32_t w = xa[7-k];
+        int off = k * 4;
+        pub[off] = w >> 24;
+        pub[off+1] = w >> 16;
+        pub[off+2] = w >> 8;
+        pub[off+3] = w;
+    }
+    
+    // Pack y coordinates (big-endian)
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        uint32_t w = ya[7-k];
+        int off = 32 + k * 4;
+        pub[off] = w >> 24;
+        pub[off+1] = w >> 16;
+        pub[off+2] = w >> 8;
+        pub[off+3] = w;
+    }
+    
     uint8_t hash[32];
-    keccak256_64(pubkey64, hash);
+    keccak256_64(pub, hash);
     
     // Copy last 20 bytes
     #pragma unroll

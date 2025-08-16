@@ -115,6 +115,26 @@ __device__ __forceinline__ uint32_t sub(uint32_t* r, const uint32_t* a, const ui
     return borrow;
 }
 
+// 256-bit integer addition (no return value) - optimized for cases where carry is not needed
+__device__ __forceinline__ void add_no_return(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "add.cc.u32  %0, %8, %16;\n\t"
+        "addc.cc.u32 %1, %9, %17;\n\t"
+        "addc.cc.u32 %2, %10, %18;\n\t"
+        "addc.cc.u32 %3, %11, %19;\n\t"
+        "addc.cc.u32 %4, %12, %20;\n\t"
+        "addc.cc.u32 %5, %13, %21;\n\t"
+        "addc.cc.u32 %6, %14, %22;\n\t"
+        "addc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]),
+          "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
+          "r"(b[4]), "r"(b[5]), "r"(b[6]), "r"(b[7])
+    );
+}
+
 // 256-bit integer subtraction (no return value) - optimized for cases where borrow is not needed
 __device__ __forceinline__ void sub_no_return(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     #if __CUDA_ARCH__ >= 300
@@ -163,6 +183,53 @@ __device__ __forceinline__ void mul32(uint32_t& lo, uint32_t& hi, uint32_t a, ui
     #endif
 }
 
+// Optimized 32-bit multiplication using mul.wide for better performance
+__device__ __forceinline__ void mul32_wide(uint32_t& lo, uint32_t& hi, uint32_t a, uint32_t b) {
+    #if __CUDA_ARCH__ >= 300
+    uint64_t result;
+    asm volatile(
+        "mul.wide.u32  %0, %1, %2;\n\t"
+        : "=l"(result)
+        : "r"(a), "r"(b)
+    );
+    lo = (uint32_t)result;
+    hi = (uint32_t)(result >> 32);
+    #else
+    // Fallback for older architectures
+    uint64_t result = (uint64_t)a * b;
+    lo = (uint32_t)result;
+    hi = (uint32_t)(result >> 32);
+    #endif
+}
+
+// Direct 64-bit multiplication using mul.wide
+__device__ __forceinline__ uint64_t mul64(uint32_t a, uint32_t b) {
+    uint64_t result;
+    asm volatile(
+        "mul.wide.u32  %0, %1, %2;\n\t"
+        : "=l"(result)
+        : "r"(a), "r"(b)
+    );
+    return result;
+}
+
+// Optimized multiplication and accumulation for mul_mod inner loops
+__device__ __forceinline__ void mul_add_carry_opt(uint32_t& t0, uint32_t& t1, uint32_t& c, 
+                                                   uint32_t a, uint32_t b) {
+    // Use simpler approach: direct 64-bit operations with better register management
+    uint64_t p = mul64(a, b);                    // p = a * b using mul.wide
+    uint64_t d = ((uint64_t)t1 << 32) | t0;     // combine t0,t1
+    asm volatile(
+        "add.cc.u64    %0, %0, %2;\n\t"         // d += p with carry
+        "addc.u32      %1, %1, 0;\n\t"          // handle overflow carry
+        : "+l"(d), "+r"(c)
+        : "l"(p)
+    );
+    t0 = (uint32_t)d;
+    t1 = (uint32_t)(d >> 32);
+ 
+}
+
 // 32-bit multiplication with addition using inline assembly
 __device__ __forceinline__ void mad32(uint32_t& lo, uint32_t& hi, uint32_t a, uint32_t b, uint32_t c) {
     #if __CUDA_ARCH__ >= 300
@@ -199,12 +266,12 @@ __device__ __forceinline__ void mad32_add(uint32_t& lo, uint32_t& hi, uint32_t a
     #endif
 }
 
-// Modular multiplication using SECP256K1 specific reduction
+// Optimized modular multiplication using SECP256K1 specific reduction with PTX assembly
 __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     uint32_t t[16] = { 0 }; // we need up to double the space (2 * 8)
     
     /*
-     * First start with the basic a * b multiplication:
+     * First start with the basic a * b multiplication using optimized PTX:
      */
     
     uint32_t t0 = 0;
@@ -217,25 +284,13 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         #pragma unroll
         for (uint32_t j = 0; j <= i; j++)
         {
-            uint32_t p_lo, p_hi;
-            mul32(p_lo, p_hi, a[j], b[i - j]);
-            
-            uint64_t d = ((uint64_t) t1) << 32 | t0;
-            uint64_t p = ((uint64_t) p_hi) << 32 | p_lo;
-            
-            d += p;
-            
-            t0 = (uint32_t) d;
-            t1 = d >> 32;
-            
-            c += d < p; // carry
+            // Use optimized multiplication and accumulation
+            mul_add_carry_opt(t0, t1, c, a[j], b[i - j]);
         }
         
         t[i] = t0;
-        
         t0 = t1;
         t1 = c;
-        
         c = 0;
     }
     
@@ -245,25 +300,13 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         #pragma unroll
         for (uint32_t j = i - 7; j < 8; j++)
         {
-            uint32_t p_lo, p_hi;
-            mul32(p_lo, p_hi, a[j], b[i - j]);
-            
-            uint64_t d = ((uint64_t) t1) << 32 | t0;
-            uint64_t p = ((uint64_t) p_hi) << 32 | p_lo;
-            
-            d += p;
-            
-            t0 = (uint32_t) d;
-            t1 = d >> 32;
-            
-            c += d < p;
+            // Use optimized multiplication and accumulation
+            mul_add_carry_opt(t0, t1, c, a[j], b[i - j]);
         }
         
         t[i] = t0;
-        
         t0 = t1;
         t1 = c;
-        
         c = 0;
     }
     
@@ -347,6 +390,8 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     }
 }
 
+// Original modular multiplication using SECP256K1 specific reduction
+
 // Modular addition
 __device__ void add_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     uint32_t carry = add(r, a, b);
@@ -389,8 +434,8 @@ __device__ void inv_mod(uint32_t* a) {
     load_secp256k1_p(p);
     
     uint32_t t1[8];
+    move_u256(t1, p);
     
-    load_secp256k1_p(t1);
     
     uint32_t t2[8] = { 0 };
     
@@ -475,7 +520,7 @@ __device__ void inv_mod(uint32_t* a) {
             
             if (gt)
             {
-                sub(t0, t0, t1);
+                sub_no_return(t0, t0, t1);
                 
                 t0[0] = t0[0] >> 1 | t0[1] << 31;
                 t0[1] = t0[1] >> 1 | t0[2] << 31;
@@ -501,9 +546,9 @@ __device__ void inv_mod(uint32_t* a) {
                     if (t2[i] > t3[i]) break;
                 }
                 
-                if (lt) add(t2, t2, p);
+                if (lt) add_no_return(t2, t2, p);
                 
-                sub(t2, t2, t3);
+                sub_no_return(t2, t2, t3);
                 
                 uint32_t c = 0;
                 
@@ -520,7 +565,7 @@ __device__ void inv_mod(uint32_t* a) {
             }
             else
             {
-                sub(t1, t1, t0);
+                sub_no_return(t1, t1, t0);
                 
                 t1[0] = t1[0] >> 1 | t1[1] << 31;
                 t1[1] = t1[1] >> 1 | t1[2] << 31;
@@ -546,9 +591,9 @@ __device__ void inv_mod(uint32_t* a) {
                     if (t3[i] > t2[i]) break;
                 }
                 
-                if (lt) add(t3, t3, p);
+                if (lt) add_no_return(t3, t3, p);
                 
-                sub(t3, t3, t2);
+                sub_no_return(t3, t3, t2);
                 
                 uint32_t c = 0;
                 
@@ -578,13 +623,6 @@ __device__ void inv_mod(uint32_t* a) {
     }
     
     // set result:
-    
-    a[0] = t2[0];
-    a[1] = t2[1];
-    a[2] = t2[2];
-    a[3] = t2[3];
-    a[4] = t2[4];
-    a[5] = t2[5];
-    a[6] = t2[6];
-    a[7] = t2[7];
+    move_u256(a, t2);
+
 }
