@@ -422,6 +422,39 @@ class CudaVanity:
         
         return optimized_kernels
     
+    def _pattern_to_bytes(self, pattern: str) -> Tuple[cp.ndarray, int]:
+        """Convert hex pattern string to byte array for GPU processing
+        
+        Args:
+            pattern: Hex pattern string (may contain wildcards '*')
+            
+        Returns:
+            Tuple of (pattern_bytes, nibble_count)
+        """
+        if not pattern:
+            return cp.zeros(0, dtype=cp.uint8), 0
+        
+        # Check if pattern contains wildcards
+        if '*' in pattern:
+            # For wildcard patterns, we use optimized kernels that don't need pattern bytes
+            return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
+        
+        pattern = pattern.lower()
+        nibble_count = len(pattern)
+        byte_count = (nibble_count + 1) // 2
+        
+        # Convert hex string to bytes (packed nibbles)
+        pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
+        for i in range(0, len(pattern), 2):
+            if i + 1 < len(pattern):
+                # Two nibbles -> one byte
+                pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
+            else:
+                # One nibble -> half byte (left-padded)
+                pattern_bytes[i // 2] = int(pattern[i], 16) << 4
+        
+        return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
+    
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
                               head_pattern: str = "",
@@ -441,33 +474,8 @@ class CudaVanity:
         num_keys = len(privkeys)
         
         # Convert pattern strings to byte arrays (only for non-wildcard patterns)
-        def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
-            if not pattern:
-                return cp.zeros(0, dtype=cp.uint8), 0
-            
-            # Check if pattern contains wildcards
-            if '*' in pattern:
-                # For wildcard patterns, we use optimized kernels that don't need pattern bytes
-                return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
-            
-            pattern = pattern.lower()
-            nibble_count = len(pattern)
-            byte_count = (nibble_count + 1) // 2
-            
-            # Convert hex string to bytes (packed nibbles)
-            pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
-            for i in range(0, len(pattern), 2):
-                if i + 1 < len(pattern):
-                    # Two nibbles -> one byte
-                    pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
-                else:
-                    # One nibble -> half byte (left-padded)
-                    pattern_bytes[i // 2] = int(pattern[i], 16) << 4
-            
-            return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
-        
-        d_head_pattern, head_nibbles = pattern_to_bytes(head_pattern)
-        d_tail_pattern, tail_nibbles = pattern_to_bytes(tail_pattern)
+        d_head_pattern, head_nibbles = self._pattern_to_bytes(head_pattern)
+        d_tail_pattern, tail_nibbles = self._pattern_to_bytes(tail_pattern)
         
         # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
         if head_nibbles == 0:
@@ -556,33 +564,8 @@ class CudaVanity:
             kernel_walker = self.kernel_walker
         
         # Convert pattern strings to byte arrays (only for non-wildcard patterns)
-        def pattern_to_bytes(pattern: str) -> Tuple[cp.ndarray, int]:
-            if not pattern:
-                return cp.zeros(0, dtype=cp.uint8), 0
-            
-            # Check if pattern contains wildcards
-            if '*' in pattern:
-                # For wildcard patterns, we use optimized kernels that don't need pattern bytes
-                return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
-            
-            pattern = pattern.lower()
-            nibble_count = len(pattern)
-            byte_count = (nibble_count + 1) // 2
-            
-            # Convert hex string to bytes (packed nibbles)
-            pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
-            for i in range(0, len(pattern), 2):
-                if i + 1 < len(pattern):
-                    # Two nibbles -> one byte
-                    pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
-                else:
-                    # One nibble -> half byte (left-padded)
-                    pattern_bytes[i // 2] = int(pattern[i], 16) << 4
-            
-            return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
-        
-        d_head_pattern, head_nibbles = pattern_to_bytes(head_pattern)
-        d_tail_pattern, tail_nibbles = pattern_to_bytes(tail_pattern)
+        d_head_pattern, head_nibbles = self._pattern_to_bytes(head_pattern)
+        d_tail_pattern, tail_nibbles = self._pattern_to_bytes(tail_pattern)
         
         # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
         if head_nibbles == 0:
