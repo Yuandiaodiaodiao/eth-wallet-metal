@@ -139,10 +139,19 @@ typedef unsigned long long uint64_t;
 #define SECP256K1_PRE_COMPUTED_XY_SIZE 96
 #define SECP256K1_NAF_SIZE 33
 
-// secp256k1 field prime P in constant memory
+// secp256k1 field prime P in constant memory (32-bit)
 __constant__ uint32_t SECP256K1_P[8] = {
     SECP256K1_P0, SECP256K1_P1, SECP256K1_P2, SECP256K1_P3,
     SECP256K1_P4, SECP256K1_P5, SECP256K1_P6, SECP256K1_P7
+};
+
+// secp256k1 field prime P in constant memory (64-bit optimized)
+// P = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F
+__constant__ uint64_t SECP256K1_P64[4] = {
+    0xfffffffefffffc2fULL,  // P0|P1: FFFFFFFE FFFFFC2F
+    0xffffffffffffffffULL,  // P2|P3: FFFFFFFF FFFFFFFF
+    0xffffffffffffffffULL,  // P4|P5: FFFFFFFF FFFFFFFF
+    0xffffffffffffffffULL   // P6|P7: FFFFFFFF FFFFFFFF
 };
 
 // Generator point G in constant memory
