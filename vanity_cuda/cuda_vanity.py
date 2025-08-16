@@ -720,7 +720,7 @@ class CudaVanity:
         start_time = time.perf_counter()
         
         # Stage 1: Compute base points
-        block_size = 64
+        block_size = 128
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print('launch compute base')
@@ -738,7 +738,7 @@ class CudaVanity:
 
         # Stage 2: Walker kernel
         # Use smaller block size for walker due to higher register usage
-        block_size = 32
+        block_size = 64
         grid_size = (num_keys + block_size - 1) // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print(f'launch walker {grid_size} {block_size}')
