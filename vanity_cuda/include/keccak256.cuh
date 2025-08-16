@@ -102,39 +102,6 @@ __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
     }
 }
 
-// Keccak-256 for 64-byte input (optimized for Ethereum public keys)
-__device__ __forceinline__ void keccak256_64(const uint8_t* input, uint8_t* output) {
-    uint64_t state[25];
-    
-    // Initialize state to zero
-    #pragma unroll
-    for (int i = 0; i < 25; i++) {
-        state[i] = 0;
-    }
-    
-    // Absorb 64 bytes (8 * 8-byte words)
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        state[i] = load64_le(input + i * 8);
-    }
-    
-    // Padding for 64-byte message (rate = 136 bytes for Keccak-256)
-    // Append domain separator (0x01) at byte 64
-    state[8] ^= 0x01ULL;
-    // Append final bit at byte 135 (bit 1087)
-    state[16] ^= 0x8000000000000000ULL;
-    
-    // Apply Keccak-f[1600]
-    keccak_f1600(state);
-    
-    // Squeeze first 32 bytes (256 bits)
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        store64_le(output + i * 8, state[i]);
-    }
-}
-
-
 
 // Compute Ethereum address from affine coordinates (last 20 bytes of Keccak-256)
 __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* ya, uint8_t* addr20) {
@@ -162,8 +129,34 @@ __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* 
         pub[off+3] = w;
     }
     
+    // Inline Keccak-256 for 64-byte input
+    uint64_t state[25];
+    
+    // Initialize state to zero
+    #pragma unroll
+    for (int i = 0; i < 25; i++) {
+        state[i] = 0;
+    }
+    
+    // Absorb 64 bytes (8 * 8-byte words)
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        state[i] = load64_le(pub + i * 8);
+    }
+    
+    // Padding for 64-byte message (rate = 136 bytes for Keccak-256)
+    state[8] ^= 0x01ULL;
+    state[16] ^= 0x8000000000000000ULL;
+    
+    // Apply Keccak-f[1600]
+    keccak_f1600(state);
+    
+    // Extract last 20 bytes directly from state (bytes 12-31 of hash)
     uint8_t hash[32];
-    keccak256_64(pub, hash);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        store64_le(hash + i * 8, state[i]);
+    }
     
     // Copy last 20 bytes
     #pragma unroll

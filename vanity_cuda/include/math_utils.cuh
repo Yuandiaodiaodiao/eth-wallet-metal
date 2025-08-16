@@ -3,21 +3,17 @@
 #include "constants.cuh"
 
 
-// Optimized 256-bit copy using PTX assembly with 8x mov.u32
+// Optimized 256-bit copy using PTX assembly with 4x mov.b64
 __forceinline__ __device__ void move_u256(uint32_t* __restrict__ dst, const uint32_t* __restrict__ src) {
     asm volatile (
-        "mov.u32 %0, %8;\n\t"
-        "mov.u32 %1, %9;\n\t"
-        "mov.u32 %2, %10;\n\t"
-        "mov.u32 %3, %11;\n\t"
-        "mov.u32 %4, %12;\n\t"
-        "mov.u32 %5, %13;\n\t"
-        "mov.u32 %6, %14;\n\t"
-        "mov.u32 %7, %15;\n\t"
-        : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3]),
-          "=r"(dst[4]), "=r"(dst[5]), "=r"(dst[6]), "=r"(dst[7])
-        : "r"(src[0]), "r"(src[1]), "r"(src[2]), "r"(src[3]),
-          "r"(src[4]), "r"(src[5]), "r"(src[6]), "r"(src[7])
+        "mov.b64 %0, %4;\n\t"
+        "mov.b64 %1, %5;\n\t"
+        "mov.b64 %2, %6;\n\t"
+        "mov.b64 %3, %7;\n\t"
+        : "=l"(*(uint64_t*)&dst[0]), "=l"(*(uint64_t*)&dst[2]),
+          "=l"(*(uint64_t*)&dst[4]), "=l"(*(uint64_t*)&dst[6])
+        : "l"(*(uint64_t*)&src[0]), "l"(*(uint64_t*)&src[2]),
+          "l"(*(uint64_t*)&src[4]), "l"(*(uint64_t*)&src[6])
     );
 }
 

@@ -56,32 +56,9 @@ extern "C" __global__ void vanity_kernel_g16(
     point_mul_xy(x, y, k_local, &G_PRECOMP);
    
 
-    // pack pub (x||y) big-endian into thread buffer
-    uint8_t pubkey[64];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint32_t w = x[7 - i];
-        int off = i * 4;
-        pubkey[off] = w >> 24;
-        pubkey[off + 1] = w >> 16;
-        pubkey[off + 2] = w >> 8;
-        pubkey[off + 3] = w;
-    }
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint32_t w = y[7 - i];
-        int off = 32 + i * 4;
-        pubkey[off] = w >> 24;
-        pubkey[off + 1] = w >> 16;
-        pubkey[off + 2] = w >> 8;
-        pubkey[off + 3] = w;
-    }
-
-
-   
-    // Compute Ethereum address
+    // Compute Ethereum address directly from affine coordinates
     uint8_t addr[20];
-    eth_address(pubkey, addr);
+    eth_address(x, y, addr);
     
     // for (int i = 0; i < 20; i++) {
     //     out_addr[i] = addr[i];
@@ -228,29 +205,9 @@ extern "C" __global__ void vanity_walker_kernel(
             move_u256(ya, ys[ii]);
             mul_mod(ya, ya, z3);
             
-            // Pack public key and compute Keccak
-            uint8_t pub[64];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                uint32_t w = xa[7-k];
-                int off = k * 4;
-                pub[off] = w >> 24;
-                pub[off+1] = w >> 16;
-                pub[off+2] = w >> 8;
-                pub[off+3] = w;
-            }
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                uint32_t w = ya[7-k];
-                int off = 32 + k * 4;
-                pub[off] = w >> 24;
-                pub[off+1] = w >> 16;
-                pub[off+2] = w >> 8;
-                pub[off+3] = w;
-            }
-            
+            // Compute Ethereum address directly from affine coordinates
             uint8_t addr[20];
-            eth_address(pub, addr);
+            eth_address(xa, ya, addr);
             
         
 
