@@ -13,88 +13,242 @@ __constant__ uint64_t KECCAK_RC[24] = {
     0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
 };
 
-// Rho offsets for Keccak
-__constant__ uint8_t KECCAK_RHO[25] = {
-     0,  1, 62, 28, 27,
-    36, 44,  6, 55, 20,
-     3, 10, 43, 25, 39,
-    41, 45, 15, 21,  8,
-    18,  2, 61, 56, 14
-};
+// Rho offsets for Keccak (inlined as constants)
+// Original values: {0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14}
 
-// Rotate left 64-bit
-__device__ __forceinline__ uint64_t rotl64(uint64_t x, uint8_t n) {
-    return (x << n) | (x >> (64 - n));
+// Rotate left 64-bit using PTX assembly
+__device__ __forceinline__ uint64_t rotl64(uint64_t x, uint32_t n) {
+    // jump these check  n must be 1-63
+    // n &= 63; // Ensure n is in valid range
+    // if (n == 0) return x;
+    
+    uint64_t result;
+    
+    asm volatile (
+        "shl.b64  %0, %1, %2;\n\t"
+        "shr.b64  %1, %1, %3;\n\t"
+        "or.b64   %0, %0, %1;"
+        : "=l"(result), "+l"(x)
+        : "r"(n), "r"(64 - n)
+    );
+    
+    return result;
 }
 
-// Load 64-bit little-endian
-__device__ __forceinline__ uint64_t load64_le(const uint8_t* src) {
-    uint64_t v = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        v |= ((uint64_t)src[i]) << (8 * i);
-    }
-    return v;
+// Optimized rotl64(x, 1) ^ y for fixed shift amount 1
+__device__ __forceinline__ uint64_t rotl64_1_xor(uint64_t x, uint64_t y) {
+    uint64_t result;
+    asm volatile (
+        "shl.b64  %0, %1, 1;\n\t"      // result = x << 1
+        "shr.b64  %1, %1, 63;\n\t"     // x = x >> 63 (reuse register)
+        "or.b64   %0, %0, %1;\n\t"     // result |= x (complete rotation)
+        "xor.b64  %0, %0, %2;"         // result ^= y
+        : "=l"(result)
+        : "l"(x), "l"(y)
+    );
+    return result;
 }
 
-// Store 64-bit little-endian
-__device__ __forceinline__ void store64_le(uint8_t* dst, uint64_t v) {
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        dst[i] = (uint8_t)((v >> (8 * i)) & 0xFF);
-    }
+// Ultra-optimized D calculation with out-of-order execution
+__device__ __forceinline__ void compute_D_optimized(uint64_t C[5], uint64_t D[5]) {
+    uint64_t temp0, temp1, temp2, temp3, temp4;
+    asm volatile (
+        // Phase 1: Parallel shl operations (no dependencies)
+        "shl.b64  %0, %10, 1;\n\t"    // D[0] shl: C[1] << 1
+        "shl.b64  %1, %11, 1;\n\t"    // D[1] shl: C[2] << 1  
+        "shl.b64  %2, %12, 1;\n\t"    // D[2] shl: C[3] << 1
+        "shl.b64  %3, %13, 1;\n\t"    // D[3] shl: C[4] << 1
+        "shl.b64  %4, %14, 1;\n\t"    // D[4] shl: C[0] << 1
+        
+        // Phase 2: Parallel shr operations using independent temp registers
+        "shr.b64  %5, %10, 63;\n\t"   // temp0: C[1] >> 63
+        "shr.b64  %6, %11, 63;\n\t"   // temp1: C[2] >> 63
+        "shr.b64  %7, %12, 63;\n\t"   // temp2: C[3] >> 63
+        "shr.b64  %8, %13, 63;\n\t"   // temp3: C[4] >> 63
+        "shr.b64  %9, %14, 63;\n\t"   // temp4: C[0] >> 63
+        
+        // Phase 3: Interleaved or and xor operations to maximize ILP
+        "or.b64   %0, %0, %5;\n\t"    // D[0] |= temp0 (complete rotation)
+        "or.b64   %1, %1, %6;\n\t"    // D[1] |= temp1
+        "or.b64   %2, %2, %7;\n\t"    // D[2] |= temp2
+        "or.b64   %3, %3, %8;\n\t"    // D[3] |= temp3
+        "or.b64   %4, %4, %9;\n\t"    // D[4] |= temp4
+
+        "xor.b64  %0, %0, %19;\n\t"   // D[0] ^= C[4] (final D[0])
+        "xor.b64  %1, %1, %15;\n\t"   // D[1] ^= C[0] (final D[1])
+        "xor.b64  %2, %2, %16;\n\t"   // D[2] ^= C[1] (final D[2])
+        "xor.b64  %3, %3, %17;\n\t"   // D[3] ^= C[2] (final D[3])
+        "xor.b64  %4, %4, %18;"       // D[4] ^= C[3] (final D[4])
+        
+        : "=l"(D[0]), "=l"(D[1]), "=l"(D[2]), "=l"(D[3]), "=l"(D[4]),
+          "=l"(temp0), "=l"(temp1), "=l"(temp2), "=l"(temp3), "=l"(temp4)
+        : "l"(C[1]), "l"(C[2]), "l"(C[3]), "l"(C[4]), "l"(C[0]),    // %10-14
+          "l"(C[0]), "l"(C[1]), "l"(C[2]), "l"(C[3]), "l"(C[4])     // %15-19
+    );
 }
+
+
 
 // Keccak-f[1600] permutation (optimized for registers)
 __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
     uint64_t C[5], D[5], B[25];
-    
-    #pragma unroll 1
     for (int round = 0; round < 24; round++) {
-        // Theta step
-        #pragma unroll
-        for (int x = 0; x < 5; x++) {
-            C[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
-        }
+        // Theta step - Split into 4 groups to reduce register pressure
+        // C[i] = state[i] ^ state[i+5] ^ state[i+10] ^ state[i+15] ^ state[i+20]
         
-        #pragma unroll
-        for (int x = 0; x < 5; x++) {
-            D[x] = rotl64(C[(x + 1) % 5], 1) ^ C[(x + 4) % 5];
-        }
+        // Group 1: Process first row (state[0-4])
+        asm volatile (
+            "xor.b64    %0, %5, %6;\n\t"     // C[0] = state[0] ^ state[5]
+            "xor.b64    %1, %7, %8;\n\t"     // C[1] = state[1] ^ state[6]
+            "xor.b64    %2, %9, %10;\n\t"    // C[2] = state[2] ^ state[7]
+            "xor.b64    %3, %11, %12;\n\t"   // C[3] = state[3] ^ state[8]  
+            "xor.b64    %4, %13, %14;"       // C[4] = state[4] ^ state[9]
+            : "=l"(C[0]), "=l"(C[1]), "=l"(C[2]), "=l"(C[3]), "=l"(C[4])
+            : "l"(state[0]), "l"(state[5]),
+              "l"(state[1]), "l"(state[6]),
+              "l"(state[2]), "l"(state[7]),
+              "l"(state[3]), "l"(state[8]),
+              "l"(state[4]), "l"(state[9])
+        );
         
-        #pragma unroll
-        for (int y = 0; y < 5; y++) {
-            #pragma unroll
-            for (int x = 0; x < 5; x++) {
-                state[y * 5 + x] ^= D[x];
-            }
-        }
+        // Group 2: XOR with second row (state[10-14])
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // C[0] ^= state[10]
+            "xor.b64    %1, %1, %6;\n\t"     // C[1] ^= state[11]
+            "xor.b64    %2, %2, %7;\n\t"     // C[2] ^= state[12]
+            "xor.b64    %3, %3, %8;\n\t"     // C[3] ^= state[13]
+            "xor.b64    %4, %4, %9;"         // C[4] ^= state[14]
+            : "+l"(C[0]), "+l"(C[1]), "+l"(C[2]), "+l"(C[3]), "+l"(C[4])
+            : "l"(state[10]), "l"(state[11]), "l"(state[12]), "l"(state[13]), "l"(state[14])
+        );
         
-        // Rho and Pi steps
-        #pragma unroll
-        for (int y = 0; y < 5; y++) {
-            #pragma unroll
-            for (int x = 0; x < 5; x++) {
-                int idx = x + 5 * y;
-                int xp = y;
-                int yp = (2 * x + 3 * y) % 5;
-                B[xp + 5 * yp] = rotl64(state[idx], KECCAK_RHO[idx]);
-            }
-        }
+        // Group 3: XOR with third row (state[15-19])
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // C[0] ^= state[15]
+            "xor.b64    %1, %1, %6;\n\t"     // C[1] ^= state[16]
+            "xor.b64    %2, %2, %7;\n\t"     // C[2] ^= state[17]
+            "xor.b64    %3, %3, %8;\n\t"     // C[3] ^= state[18]
+            "xor.b64    %4, %4, %9;"         // C[4] ^= state[19]
+            : "+l"(C[0]), "+l"(C[1]), "+l"(C[2]), "+l"(C[3]), "+l"(C[4])
+            : "l"(state[15]), "l"(state[16]), "l"(state[17]), "l"(state[18]), "l"(state[19])
+        );
         
-        // Chi step
+        // Group 4: XOR with fourth row (state[20-24])
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // C[0] ^= state[20]
+            "xor.b64    %1, %1, %6;\n\t"     // C[1] ^= state[21]
+            "xor.b64    %2, %2, %7;\n\t"     // C[2] ^= state[22]
+            "xor.b64    %3, %3, %8;\n\t"     // C[3] ^= state[23]
+            "xor.b64    %4, %4, %9;"         // C[4] ^= state[24]
+            : "+l"(C[0]), "+l"(C[1]), "+l"(C[2]), "+l"(C[3]), "+l"(C[4])
+            : "l"(state[20]), "l"(state[21]), "l"(state[22]), "l"(state[23]), "l"(state[24])
+        );
+        
+        // D calculation - ultra-optimized inline assembly
+        compute_D_optimized(C, D);
+        
+        // State update - optimized with 5-group assembly
+        // Group 1: state[0-4] ^= D[0-4]
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // state[0] ^= D[0]
+            "xor.b64    %1, %1, %6;\n\t"     // state[1] ^= D[1]
+            "xor.b64    %2, %2, %7;\n\t"     // state[2] ^= D[2]
+            "xor.b64    %3, %3, %8;\n\t"     // state[3] ^= D[3]
+            "xor.b64    %4, %4, %9;"         // state[4] ^= D[4]
+            : "+l"(state[0]), "+l"(state[1]), "+l"(state[2]), "+l"(state[3]), "+l"(state[4])
+            : "l"(D[0]), "l"(D[1]), "l"(D[2]), "l"(D[3]), "l"(D[4])
+        );
+        
+        // Group 2: state[5-9] ^= D[0-4]
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // state[5] ^= D[0]
+            "xor.b64    %1, %1, %6;\n\t"     // state[6] ^= D[1]
+            "xor.b64    %2, %2, %7;\n\t"     // state[7] ^= D[2]
+            "xor.b64    %3, %3, %8;\n\t"     // state[8] ^= D[3]
+            "xor.b64    %4, %4, %9;"         // state[9] ^= D[4]
+            : "+l"(state[5]), "+l"(state[6]), "+l"(state[7]), "+l"(state[8]), "+l"(state[9])
+            : "l"(D[0]), "l"(D[1]), "l"(D[2]), "l"(D[3]), "l"(D[4])
+        );
+        
+        // Group 3: state[10-14] ^= D[0-4]
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // state[10] ^= D[0]
+            "xor.b64    %1, %1, %6;\n\t"     // state[11] ^= D[1]
+            "xor.b64    %2, %2, %7;\n\t"     // state[12] ^= D[2]
+            "xor.b64    %3, %3, %8;\n\t"     // state[13] ^= D[3]
+            "xor.b64    %4, %4, %9;"         // state[14] ^= D[4]
+            : "+l"(state[10]), "+l"(state[11]), "+l"(state[12]), "+l"(state[13]), "+l"(state[14])
+            : "l"(D[0]), "l"(D[1]), "l"(D[2]), "l"(D[3]), "l"(D[4])
+        );
+        
+        // Group 4: state[15-19] ^= D[0-4]
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // state[15] ^= D[0]
+            "xor.b64    %1, %1, %6;\n\t"     // state[16] ^= D[1]
+            "xor.b64    %2, %2, %7;\n\t"     // state[17] ^= D[2]
+            "xor.b64    %3, %3, %8;\n\t"     // state[18] ^= D[3]
+            "xor.b64    %4, %4, %9;"         // state[19] ^= D[4]
+            : "+l"(state[15]), "+l"(state[16]), "+l"(state[17]), "+l"(state[18]), "+l"(state[19])
+            : "l"(D[0]), "l"(D[1]), "l"(D[2]), "l"(D[3]), "l"(D[4])
+        );
+        
+        // Group 5: state[20-24] ^= D[0-4]
+        asm volatile (
+            "xor.b64    %0, %0, %5;\n\t"     // state[20] ^= D[0]
+            "xor.b64    %1, %1, %6;\n\t"     // state[21] ^= D[1]
+            "xor.b64    %2, %2, %7;\n\t"     // state[22] ^= D[2]
+            "xor.b64    %3, %3, %8;\n\t"     // state[23] ^= D[3]
+            "xor.b64    %4, %4, %9;"         // state[24] ^= D[4]
+            : "+l"(state[20]), "+l"(state[21]), "+l"(state[22]), "+l"(state[23]), "+l"(state[24])
+            : "l"(D[0]), "l"(D[1]), "l"(D[2]), "l"(D[3]), "l"(D[4])
+        );
+        
+        // Rho and Pi steps - fully unrolled with inlined constants
+        // y=0
+        B[0] = state[0];   // x=0, y=0: yp=(3*0)%5=0
+        B[10] = rotl64(state[1], 1U);  // x=1, y=0: yp=(2+3*0)%5=2
+        B[20] = rotl64(state[2], 62U); // x=2, y=0: yp=(4+3*0)%5=4
+        B[5] = rotl64(state[3], 28U);  // x=3, y=0: yp=(1+3*0)%5=1
+        B[15] = rotl64(state[4], 27U); // x=4, y=0: yp=(3+3*0)%5=3
+        
+        // y=1
+        B[16] = rotl64(state[5], 36U); // x=0, y=1: yp=(3*1)%5=3
+        B[1] = rotl64(state[6], 44U);  // x=1, y=1: yp=(2+3*1)%5=0
+        B[11] = rotl64(state[7], 6U);  // x=2, y=1: yp=(4+3*1)%5=2
+        B[21] = rotl64(state[8], 55U); // x=3, y=1: yp=(1+3*1)%5=4
+        B[6] = rotl64(state[9], 20U);  // x=4, y=1: yp=(3+3*1)%5=1
+        
+        // y=2
+        B[7] = rotl64(state[10], 3U);  // x=0, y=2: yp=(3*2)%5=1
+        B[17] = rotl64(state[11], 10U); // x=1, y=2: yp=(2+3*2)%5=3
+        B[2] = rotl64(state[12], 43U); // x=2, y=2: yp=(4+3*2)%5=0
+        B[12] = rotl64(state[13], 25U); // x=3, y=2: yp=(1+3*2)%5=2
+        B[22] = rotl64(state[14], 39U); // x=4, y=2: yp=(3+3*2)%5=4
+        
+        // y=3
+        B[23] = rotl64(state[15], 41U); // x=0, y=3: yp=(3*3)%5=4
+        B[8] = rotl64(state[16], 45U); // x=1, y=3: yp=(2+3*3)%5=1
+        B[18] = rotl64(state[17], 15U); // x=2, y=3: yp=(4+3*3)%5=3
+        B[3] = rotl64(state[18], 21U); // x=3, y=3: yp=(1+3*3)%5=0
+        B[13] = rotl64(state[19], 8U); // x=4, y=3: yp=(3+3*3)%5=2
+        
+        // y=4
+        B[14] = rotl64(state[20], 18U); // x=0, y=4: yp=(3*4)%5=2
+        B[24] = rotl64(state[21], 2U); // x=1, y=4: yp=(2+3*4)%5=4
+        B[9] = rotl64(state[22], 61U); // x=2, y=4: yp=(4+3*4)%5=1
+        B[19] = rotl64(state[23], 56U); // x=3, y=4: yp=(1+3*4)%5=3
+        B[4] = rotl64(state[24], 14U); // x=4, y=4: yp=(3+3*4)%5=0
+        
+        // Chi step - fully unrolled with no modulo operations
         #pragma unroll
         for (int y = 0; y < 5; y++) {
             int yy = y * 5;
-            uint64_t t[5];
-            #pragma unroll
-            for (int x = 0; x < 5; x++) {
-                t[x] = B[yy + x];
-            }
-            #pragma unroll
-            for (int x = 0; x < 5; x++) {
-                state[yy + x] = t[x] ^ ((~t[(x + 1) % 5]) & t[(x + 2) % 5]);
-            }
+            // Direct computation without temporary array
+            state[yy + 0] = B[yy + 0] ^ ((~B[yy + 1]) & B[yy + 2]);
+            state[yy + 1] = B[yy + 1] ^ ((~B[yy + 2]) & B[yy + 3]);
+            state[yy + 2] = B[yy + 2] ^ ((~B[yy + 3]) & B[yy + 4]);
+            state[yy + 3] = B[yy + 3] ^ ((~B[yy + 4]) & B[yy + 0]);
+            state[yy + 4] = B[yy + 4] ^ ((~B[yy + 0]) & B[yy + 1]);
         }
         
         // Iota step

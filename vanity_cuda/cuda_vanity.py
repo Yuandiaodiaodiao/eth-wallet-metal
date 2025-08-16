@@ -507,7 +507,12 @@ class CudaVanity:
         program_options = ProgramOptions(
             arch=f"sm_{self.arch}",
             include_path=include_paths,
-            use_fast_math=True
+            use_fast_math=True,
+            split_compile=8,
+            device_int128=True,
+            ptxas_options=["-O3"],
+            device_code_optimize=True,
+            extra_device_vectorization=True,
         )
         
         # Create and compile program
@@ -756,21 +761,7 @@ class CudaVanity:
                 cp.uint32(steps_per_thread), # steps_per_thread
             )
         else:
-            # Standard kernel with pattern parameters
-            launch(
-                self.stream,
-                config,
-                kernel_walker,
-                d_basepoints.data.ptr,      # basepoints
-                d_found_indices.data.ptr,   # found_indices
-                d_found_count.data.ptr,     # found_count
-                cp.uint32(num_keys),        # num_keys
-                cp.uint32(steps_per_thread), # steps_per_thread
-                d_head_pattern.data.ptr,    # head_pattern
-                cp.uint32(head_nibbles),    # head_nibbles
-                d_tail_pattern.data.ptr,    # tail_pattern
-                cp.uint32(tail_nibbles)     # tail_nibbles
-            )
+           raise NotImplementedError("Pattern optimization is not supported for walker kernel")
         print('sync')
         # Wait for completion
         self.stream.sync()
