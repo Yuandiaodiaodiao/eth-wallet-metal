@@ -2,6 +2,25 @@
 
 #include "constants.cuh"
 
+
+// Optimized 256-bit copy using PTX assembly with 8x mov.u32
+__forceinline__ __device__ void move_u256(uint32_t* __restrict__ dst, const uint32_t* __restrict__ src) {
+    asm volatile (
+        "mov.u32 %0, %8;\n\t"
+        "mov.u32 %1, %9;\n\t"
+        "mov.u32 %2, %10;\n\t"
+        "mov.u32 %3, %11;\n\t"
+        "mov.u32 %4, %12;\n\t"
+        "mov.u32 %5, %13;\n\t"
+        "mov.u32 %6, %14;\n\t"
+        "mov.u32 %7, %15;\n\t"
+        : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3]),
+          "=r"(dst[4]), "=r"(dst[5]), "=r"(dst[6]), "=r"(dst[7])
+        : "r"(src[0]), "r"(src[1]), "r"(src[2]), "r"(src[3]),
+          "r"(src[4]), "r"(src[5]), "r"(src[6]), "r"(src[7])
+    );
+}
+
 // Optimized SECP256K1_P constant loading using PTX assembly
 __device__ __forceinline__ void load_secp256k1_p(uint32_t* t) {
     // SECP256K1_P = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F
@@ -94,6 +113,37 @@ __device__ __forceinline__ uint32_t sub(uint32_t* r, const uint32_t* a, const ui
     #endif
     
     return borrow;
+}
+
+// 256-bit integer subtraction (no return value) - optimized for cases where borrow is not needed
+__device__ __forceinline__ void sub_no_return(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+    #if __CUDA_ARCH__ >= 300
+    asm volatile(
+        "sub.cc.u32  %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]),
+          "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
+          "r"(b[4]), "r"(b[5]), "r"(b[6]), "r"(b[7])
+    );
+    #else
+    // Fallback for older architectures
+    uint32_t borrow = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t diff = a[i] - b[i] - borrow;
+        borrow = (diff > a[i]) ? 1 : borrow;
+        r[i] = diff;
+    }
+    #endif
 }
 
 // 32-bit multiplication using inline assembly to avoid 64-bit registers
@@ -280,7 +330,7 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     #pragma unroll
     for (uint32_t i = c; i > 0; i--)
     {
-        sub(r, r, t);
+        sub_no_return(r, r, t);
     }
     
     #pragma unroll
@@ -290,7 +340,7 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         
         if (r[i] > t[i])
         {
-            sub(r, r, t);
+            sub_no_return(r, r, t);
             
             break;
         }
@@ -330,14 +380,9 @@ __device__ void sub_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
 __device__ void inv_mod(uint32_t* a) {
     uint32_t t0[8];
     
-    t0[0] = a[0];
-    t0[1] = a[1];
-    t0[2] = a[2];
-    t0[3] = a[3];
-    t0[4] = a[4];
-    t0[5] = a[5];
-    t0[6] = a[6];
-    t0[7] = a[7];
+    move_u256(t0, a);
+
+
     
     uint32_t p[8];
     

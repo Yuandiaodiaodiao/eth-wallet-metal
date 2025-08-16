@@ -4,6 +4,8 @@
 #include "include/secp256k1.cuh"
 #include "include/keccak256.cuh"
 
+
+
 // Batch size for walker kernel (matches Metal implementation)
 #define BATCH_WINDOW_SIZE 512
 
@@ -159,21 +161,18 @@ extern "C" __global__ void vanity_walker_kernel(
     // Load precomputed base point (x0, y0) and initialize z0
     const uint32_t* base_point = basepoints + gid * 16;
     uint32_t x0[8], y0[8], z0[8];
+    move_u256(x0, base_point);
+    move_u256(y0, base_point + 8);
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        x0[i] = base_point[i];
-        y0[i] = base_point[8 + i];
         z0[i] = 0;  // Initialize z0
     }
     z0[0] = 1;
     
     // Prepare delta = G (affine)
     uint32_t dx[8], dy[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        dx[i] = SECP256K1_G[i];
-        dy[i] = SECP256K1_G[8 + i];
-    }
+    move_u256(dx, SECP256K1_G);
+    move_u256(dy, SECP256K1_G + 8);
     
     
     // Stack arrays for batch processing - fixed size to avoid overflow
@@ -187,40 +186,28 @@ extern "C" __global__ void vanity_walker_kernel(
     while (processed < steps_per_thread) {
         // Generate batch_size points by repeated addition
         for (int i = 0; i < BATCH_WINDOW_SIZE; ++i) {
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                xs[i][k] = x0[k];
-                ys[i][k] = y0[k];
-                zs[i][k] = z0[k];
-            }
+            move_u256(xs[i], x0);
+            move_u256(ys[i], y0);
+            move_u256(zs[i], z0);
             point_add(x0, y0, z0, dx, dy);
         }
         
         // Batch inversion using Montgomery trick
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            pref[0][k] = zs[0][k];
-        }
+        move_u256(pref[0], zs[0]);
         for (int i = 1; i < BATCH_WINDOW_SIZE; ++i) {
             mul_mod(pref[i], pref[i-1], zs[i]);
         }
         
         // Inverse total
         uint32_t inv_total[8];
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            inv_total[k] = pref[BATCH_WINDOW_SIZE-1][k];
-        }
+        move_u256(inv_total, pref[BATCH_WINDOW_SIZE-1]);
         inv_mod(inv_total);
         
         // Backward pass and vanity check
         for (int ii = (int)BATCH_WINDOW_SIZE-1; ii >= 0; --ii) {
             uint32_t inv_z[8];
             if (ii == 0) {
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    inv_z[k] = inv_total[k];
-                }
+                move_u256(inv_z, inv_total);
             } else {
                 mul_mod(inv_z, inv_total, pref[ii-1]);
             }
@@ -228,26 +215,17 @@ extern "C" __global__ void vanity_walker_kernel(
             
             // Convert to affine coordinates
             uint32_t z2[8];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                z2[k] = inv_z[k];
-            }
+            move_u256(z2, inv_z);
             mul_mod(z2, z2, z2);
             
             uint32_t xa[8];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                xa[k] = xs[ii][k];
-            }
+            move_u256(xa, xs[ii]);
             mul_mod(xa, xa, z2);
             
             uint32_t z3[8];
             mul_mod(z3, z2, inv_z);
             uint32_t ya[8];
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                ya[k] = ys[ii][k];
-            }
+            move_u256(ya, ys[ii]);
             mul_mod(ya, ya, z3);
             
             // Pack public key and compute Keccak
