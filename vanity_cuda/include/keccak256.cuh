@@ -148,41 +148,37 @@ __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* 
     // x coordinates (32 bytes): xa[7] xa[6] xa[5] xa[4] xa[3] xa[2] xa[1] xa[0] in big-endian
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        // Each iteration processes 2 uint32s (8 bytes total) into 1 uint64
-        uint32_t w_hi = xa[7 - i * 2];     // Higher address word
-        uint32_t w_lo = xa[6 - i * 2];     // Lower address word
+        uint32_t w_hi = xa[7 - i * 2];
+        uint32_t w_lo = xa[6 - i * 2];
         
-        // Convert each uint32 to big-endian bytes, then pack as little-endian uint64
-        uint64_t bytes_hi = ((uint64_t)(w_hi >> 24) & 0xFF) |
-                           (((uint64_t)(w_hi >> 16) & 0xFF) << 8) |
-                           (((uint64_t)(w_hi >> 8) & 0xFF) << 16) |
-                           (((uint64_t)(w_hi) & 0xFF) << 24);
+        uint32_t bytes_hi, bytes_lo;
         
-        uint64_t bytes_lo = ((uint64_t)(w_lo >> 24) & 0xFF) |
-                           (((uint64_t)(w_lo >> 16) & 0xFF) << 8) |
-                           (((uint64_t)(w_lo >> 8) & 0xFF) << 16) |
-                           (((uint64_t)(w_lo) & 0xFF) << 24);
+        asm volatile (
+            "prmt.b32 %0, %2, 0, 0x0123;\n\t"
+            "prmt.b32 %1, %3, 0, 0x0123;"
+            : "=r"(bytes_hi), "=r"(bytes_lo)
+            : "r"(w_hi), "r"(w_lo)
+        );
         
-        state[i] = bytes_hi | (bytes_lo << 32);
+        state[i] = ((uint64_t)bytes_hi) | (((uint64_t)bytes_lo) << 32);
     }
     
     // y coordinates (32 bytes): ya[7] ya[6] ya[5] ya[4] ya[3] ya[2] ya[1] ya[0] in big-endian
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        uint32_t w_hi = ya[7 - i * 2];     
-        uint32_t w_lo = ya[6 - i * 2];     
+        uint32_t w_hi = ya[7 - i * 2];
+        uint32_t w_lo = ya[6 - i * 2];
         
-        uint64_t bytes_hi = ((uint64_t)(w_hi >> 24) & 0xFF) |
-                           (((uint64_t)(w_hi >> 16) & 0xFF) << 8) |
-                           (((uint64_t)(w_hi >> 8) & 0xFF) << 16) |
-                           (((uint64_t)(w_hi) & 0xFF) << 24);
+        uint32_t bytes_hi, bytes_lo;
         
-        uint64_t bytes_lo = ((uint64_t)(w_lo >> 24) & 0xFF) |
-                           (((uint64_t)(w_lo >> 16) & 0xFF) << 8) |
-                           (((uint64_t)(w_lo >> 8) & 0xFF) << 16) |
-                           (((uint64_t)(w_lo) & 0xFF) << 24);
+        asm volatile (
+            "prmt.b32 %0, %2, 0, 0x0123;\n\t"
+            "prmt.b32 %1, %3, 0, 0x0123;"
+            : "=r"(bytes_hi), "=r"(bytes_lo)
+            : "r"(w_hi), "r"(w_lo)
+        );
         
-        state[4 + i] = bytes_hi | (bytes_lo << 32);
+        state[4 + i] = ((uint64_t)bytes_hi) | (((uint64_t)bytes_lo) << 32);
     }
     
     // Padding for 64-byte message (rate = 136 bytes for Keccak-256)
