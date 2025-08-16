@@ -74,9 +74,58 @@ __device__ __forceinline__ uint32_t sub(uint32_t* r, const uint32_t* a, const ui
     return borrow;
 }
 
+// 32-bit multiplication using inline assembly to avoid 64-bit registers
+__device__ __forceinline__ void mul32(uint32_t& lo, uint32_t& hi, uint32_t a, uint32_t b) {
+    #if __CUDA_ARCH__ >= 300
+    asm volatile(
+        "mul.lo.u32  %0, %2, %3;\n\t"
+        "mul.hi.u32  %1, %2, %3;\n\t"
+        : "=r"(lo), "=r"(hi)
+        : "r"(a), "r"(b)
+    );
+    #else
+    // Fallback for older architectures
+    uint64_t result = (uint64_t)a * b;
+    lo = (uint32_t)result;
+    hi = (uint32_t)(result >> 32);
+    #endif
+}
 
+// 32-bit multiplication with addition using inline assembly
+__device__ __forceinline__ void mad32(uint32_t& lo, uint32_t& hi, uint32_t a, uint32_t b, uint32_t c) {
+    #if __CUDA_ARCH__ >= 300
+    asm volatile(
+        "mad.lo.cc.u32  %0, %2, %3, %4;\n\t"
+        "madc.hi.u32    %1, %2, %3, 0;\n\t"
+        : "=r"(lo), "=r"(hi)
+        : "r"(a), "r"(b), "r"(c)
+    );
+    #else
+    // Fallback for older architectures
+    uint64_t result = (uint64_t)a * b + c;
+    lo = (uint32_t)result;
+    hi = (uint32_t)(result >> 32);
+    #endif
+}
 
-
+// 32-bit multiplication with double addition using inline assembly
+__device__ __forceinline__ void mad32_add(uint32_t& lo, uint32_t& hi, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    #if __CUDA_ARCH__ >= 300
+    asm volatile(
+        "mad.lo.cc.u32  %0, %2, %3, %4;\n\t"
+        "madc.hi.cc.u32 %1, %2, %3, 0;\n\t"
+        "add.cc.u32     %0, %0, %5;\n\t"
+        "addc.u32       %1, %1, 0;\n\t"
+        : "=r"(lo), "=r"(hi)
+        : "r"(a), "r"(b), "r"(c), "r"(d)
+    );
+    #else
+    // Fallback for older architectures
+    uint64_t result = (uint64_t)a * b + c + d;
+    lo = (uint32_t)result;
+    hi = (uint32_t)(result >> 32);
+    #endif
+}
 
 // Modular multiplication using SECP256K1 specific reduction
 __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
@@ -96,9 +145,11 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         #pragma unroll
         for (uint32_t j = 0; j <= i; j++)
         {
-            uint64_t p = ((uint64_t) a[j]) * b[i - j];
+            uint32_t p_lo, p_hi;
+            mul32(p_lo, p_hi, a[j], b[i - j]);
             
             uint64_t d = ((uint64_t) t1) << 32 | t0;
+            uint64_t p = ((uint64_t) p_hi) << 32 | p_lo;
             
             d += p;
             
@@ -122,9 +173,11 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
         #pragma unroll
         for (uint32_t j = i - 7; j < 8; j++)
         {
-            uint64_t p = ((uint64_t) a[j]) * b[i - j];
+            uint32_t p_lo, p_hi;
+            mul32(p_lo, p_hi, a[j], b[i - j]);
             
             uint64_t d = ((uint64_t) t1) << 32 | t0;
+            uint64_t p = ((uint64_t) p_hi) << 32 | p_lo;
             
             d += p;
             
@@ -157,11 +210,11 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     #pragma unroll
     for (uint32_t i = 0, j = 8; i < 8; i++, j++)
     {
-        uint64_t p = ((uint64_t) 0x03d1) * t[j] + c;
+        uint32_t p_lo, p_hi;
+        mad32(p_lo, p_hi, 0x03d1, t[j], c);
         
-        tmp[i] = (uint32_t) p;
-        
-        c = p >> 32;
+        tmp[i] = p_lo;
+        c = p_hi;
     }
     
     tmp[8] = c;
@@ -181,11 +234,11 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     #pragma unroll
     for (uint32_t i = 0, j = 8; i < 8; i++, j++)
     {
-        uint64_t p = ((uint64_t) 0x3d1) * tmp[j] + c2;
+        uint32_t p_lo, p_hi;
+        mad32(p_lo, p_hi, 0x3d1, tmp[j], c2);
         
-        t[i] = (uint32_t) p;
-        
-        c2 = p >> 32;
+        t[i] = p_lo;
+        c2 = p_hi;
     }
     
     t[8] = c2;
