@@ -2,6 +2,28 @@
 
 #include "constants.cuh"
 
+// Optimized SECP256K1_P constant loading using PTX assembly
+__device__ __forceinline__ void load_secp256k1_p(uint32_t* t) {
+    // SECP256K1_P = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F
+    // Using PTX assembly for direct register operations and optimal performance
+    #if __CUDA_ARCH__ >= 300
+    asm volatile(
+        "mov.u64 %0, 0xfffffffefffffc2f;\n\t"    // t[0:1] = FFFFFFFE FFFFFC2F
+        "mov.u64 %1, 0xffffffffffffffff;\n\t"    // t[2:3] = FFFFFFFF FFFFFFFF
+        "mov.u64 %2, 0xffffffffffffffff;\n\t"    // t[4:5] = FFFFFFFF FFFFFFFF
+        "mov.u64 %3, 0xffffffffffffffff;\n\t"    // t[6:7] = FFFFFFFF FFFFFFFF
+        : "=l"(*(uint64_t*)&t[0]), "=l"(*(uint64_t*)&t[2]),
+          "=l"(*(uint64_t*)&t[4]), "=l"(*(uint64_t*)&t[6])
+    );
+    #else
+    // Fallback for older architectures
+    *(uint64_t*)&t[0] = 0xfffffffefffffc2fULL;  // P0|P1: FFFFFFFE FFFFFC2F
+    *(uint64_t*)&t[2] = 0xffffffffffffffffULL;  // P2|P3: FFFFFFFF FFFFFFFF
+    *(uint64_t*)&t[4] = 0xffffffffffffffffULL;  // P4|P5: FFFFFFFF FFFFFFFF
+    *(uint64_t*)&t[6] = 0xffffffffffffffffULL;  // P6|P7: FFFFFFFF FFFFFFFF
+    #endif
+}
+
 // 256-bit integer addition (returns carry) - internal helper
 __device__ __forceinline__ uint32_t add(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     uint32_t carry = 0;
@@ -253,14 +275,7 @@ __device__ void mul_mod(uint32_t* r, const uint32_t* a, const uint32_t* b) {
     
     c += c2;
     
-    t[0] = SECP256K1_P0;
-    t[1] = SECP256K1_P1;
-    t[2] = SECP256K1_P2;
-    t[3] = SECP256K1_P3;
-    t[4] = SECP256K1_P4;
-    t[5] = SECP256K1_P5;
-    t[6] = SECP256K1_P6;
-    t[7] = SECP256K1_P7;
+    load_secp256k1_p(t);
     
     #pragma unroll
     for (uint32_t i = c; i > 0; i--)
@@ -326,25 +341,11 @@ __device__ void inv_mod(uint32_t* a) {
     
     uint32_t p[8];
     
-    p[0] = SECP256K1_P0;
-    p[1] = SECP256K1_P1;
-    p[2] = SECP256K1_P2;
-    p[3] = SECP256K1_P3;
-    p[4] = SECP256K1_P4;
-    p[5] = SECP256K1_P5;
-    p[6] = SECP256K1_P6;
-    p[7] = SECP256K1_P7;
+    load_secp256k1_p(p);
     
     uint32_t t1[8];
     
-    t1[0] = SECP256K1_P0;
-    t1[1] = SECP256K1_P1;
-    t1[2] = SECP256K1_P2;
-    t1[3] = SECP256K1_P3;
-    t1[4] = SECP256K1_P4;
-    t1[5] = SECP256K1_P5;
-    t1[6] = SECP256K1_P6;
-    t1[7] = SECP256K1_P7;
+    load_secp256k1_p(t1);
     
     uint32_t t2[8] = { 0 };
     
