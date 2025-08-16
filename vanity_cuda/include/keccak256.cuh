@@ -103,45 +103,86 @@ __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
 }
 
 
+// Ultra-fast zero 17 uint64_t elements using PTX assembly
+__device__ __forceinline__ void zero_17(uint64_t* ptr) {
+    asm volatile (
+        "mov.b64 %0, 0;\n\t"
+        "mov.b64 %1, 0;\n\t"
+        "mov.b64 %2, 0;\n\t"
+        "mov.b64 %3, 0;\n\t"
+        "mov.b64 %4, 0;\n\t"
+        "mov.b64 %5, 0;\n\t"
+        "mov.b64 %6, 0;\n\t"
+        "mov.b64 %7, 0;\n\t"
+        "mov.b64 %8, 0;\n\t"
+        "mov.b64 %9, 0;\n\t"
+        "mov.b64 %10, 0;\n\t"
+        "mov.b64 %11, 0;\n\t"
+        "mov.b64 %12, 0;\n\t"
+        "mov.b64 %13, 0;\n\t"
+        "mov.b64 %14, 0;\n\t"
+        "mov.b64 %15, 0;\n\t"
+        "mov.b64 %16, 0;"
+        : "=l"(ptr[0]), "=l"(ptr[1]), "=l"(ptr[2]), "=l"(ptr[3]),
+          "=l"(ptr[4]), "=l"(ptr[5]), "=l"(ptr[6]), "=l"(ptr[7]),
+          "=l"(ptr[8]), "=l"(ptr[9]), "=l"(ptr[10]), "=l"(ptr[11]),
+          "=l"(ptr[12]), "=l"(ptr[13]), "=l"(ptr[14]), "=l"(ptr[15]),
+          "=l"(ptr[16])
+        :
+        : "memory"
+    );
+}
+
 // Compute Ethereum address from affine coordinates (last 20 bytes of Keccak-256)
 __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* ya, uint8_t* addr20) {
-    uint8_t pub[64];
-    
-    // Pack x coordinates (big-endian)
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        uint32_t w = xa[7-k];
-        int off = k * 4;
-        pub[off] = w >> 24;
-        pub[off+1] = w >> 16;
-        pub[off+2] = w >> 8;
-        pub[off+3] = w;
-    }
-    
-    // Pack y coordinates (big-endian)
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        uint32_t w = ya[7-k];
-        int off = 32 + k * 4;
-        pub[off] = w >> 24;
-        pub[off+1] = w >> 16;
-        pub[off+2] = w >> 8;
-        pub[off+3] = w;
-    }
-    
     // Inline Keccak-256 for 64-byte input
     uint64_t state[25];
     
-    // Initialize state to zero
+    // Initialize state to zero using optimized PTX assembly
+    zero_17(&state[8]);
+    
+    // Directly pack coordinates into state array 
+    // Need to convert xa,ya (little-endian uint32 arrays) to big-endian byte sequence
+    // then load as little-endian uint64 for keccak
+    
+    // x coordinates (32 bytes): xa[7] xa[6] xa[5] xa[4] xa[3] xa[2] xa[1] xa[0] in big-endian
     #pragma unroll
-    for (int i = 0; i < 25; i++) {
-        state[i] = 0;
+    for (int i = 0; i < 4; i++) {
+        // Each iteration processes 2 uint32s (8 bytes total) into 1 uint64
+        uint32_t w_hi = xa[7 - i * 2];     // Higher address word
+        uint32_t w_lo = xa[6 - i * 2];     // Lower address word
+        
+        // Convert each uint32 to big-endian bytes, then pack as little-endian uint64
+        uint64_t bytes_hi = ((uint64_t)(w_hi >> 24) & 0xFF) |
+                           (((uint64_t)(w_hi >> 16) & 0xFF) << 8) |
+                           (((uint64_t)(w_hi >> 8) & 0xFF) << 16) |
+                           (((uint64_t)(w_hi) & 0xFF) << 24);
+        
+        uint64_t bytes_lo = ((uint64_t)(w_lo >> 24) & 0xFF) |
+                           (((uint64_t)(w_lo >> 16) & 0xFF) << 8) |
+                           (((uint64_t)(w_lo >> 8) & 0xFF) << 16) |
+                           (((uint64_t)(w_lo) & 0xFF) << 24);
+        
+        state[i] = bytes_hi | (bytes_lo << 32);
     }
     
-    // Absorb 64 bytes (8 * 8-byte words)
+    // y coordinates (32 bytes): ya[7] ya[6] ya[5] ya[4] ya[3] ya[2] ya[1] ya[0] in big-endian
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        state[i] = load64_le(pub + i * 8);
+    for (int i = 0; i < 4; i++) {
+        uint32_t w_hi = ya[7 - i * 2];     
+        uint32_t w_lo = ya[6 - i * 2];     
+        
+        uint64_t bytes_hi = ((uint64_t)(w_hi >> 24) & 0xFF) |
+                           (((uint64_t)(w_hi >> 16) & 0xFF) << 8) |
+                           (((uint64_t)(w_hi >> 8) & 0xFF) << 16) |
+                           (((uint64_t)(w_hi) & 0xFF) << 24);
+        
+        uint64_t bytes_lo = ((uint64_t)(w_lo >> 24) & 0xFF) |
+                           (((uint64_t)(w_lo >> 16) & 0xFF) << 8) |
+                           (((uint64_t)(w_lo >> 8) & 0xFF) << 16) |
+                           (((uint64_t)(w_lo) & 0xFF) << 24);
+        
+        state[4 + i] = bytes_hi | (bytes_lo << 32);
     }
     
     // Padding for 64-byte message (rate = 136 bytes for Keccak-256)
