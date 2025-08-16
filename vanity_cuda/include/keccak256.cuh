@@ -83,6 +83,7 @@ __device__ __forceinline__ void compute_D_optimized(uint64_t C[5], uint64_t D[5]
 // Keccak-f[1600] permutation (optimized for registers)
 __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
     uint64_t C[5], D[5], B[25];
+
     for (int round = 0; round < 24; round++) {
         // Theta step - Split into 4 groups to reduce register pressure
         // C[i] = state[i] ^ state[i+5] ^ state[i+10] ^ state[i+15] ^ state[i+20]
@@ -198,55 +199,141 @@ __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
         // y=0
         B[0] = state[0];   // x=0, y=0: yp=(3*0)%5=0
         
-        // Optimized rotl64 operations using inline assembly
+        // Optimized rotl64 operations with instruction reordering for ILP
         asm volatile (
+            // Phase 1: All shl operations in parallel (no dependencies)
             "shl.b64  %0, %4, 1;\n\t"      // B[10] = state[1] << 1
-            "shr.b64  %4, %4, 63;\n\t"     // temp = state[1] >> 63
-            "or.b64   %0, %0, %4;\n\t"     // B[10] |= temp (rotl64(state[1], 1))
-            
             "shl.b64  %1, %5, 62;\n\t"     // B[20] = state[2] << 62
-            "shr.b64  %5, %5, 2;\n\t"      // temp = state[2] >> 2
-            "or.b64   %1, %1, %5;\n\t"     // B[20] |= temp (rotl64(state[2], 62))
-            
             "shl.b64  %2, %6, 28;\n\t"     // B[5] = state[3] << 28
-            "shr.b64  %6, %6, 36;\n\t"     // temp = state[3] >> 36
-            "or.b64   %2, %2, %6;\n\t"     // B[5] |= temp (rotl64(state[3], 28))
-            
             "shl.b64  %3, %7, 27;\n\t"     // B[15] = state[4] << 27
-            "shr.b64  %7, %7, 37;\n\t"     // temp = state[4] >> 37
-            "or.b64   %3, %3, %7;"         // B[15] |= temp (rotl64(state[4], 27))
+            
+            // Phase 2: All shr operations in parallel (input reuse optimization)
+            "shr.b64  %4, %4, 63;\n\t"     // temp1 = state[1] >> 63
+            "shr.b64  %5, %5, 2;\n\t"      // temp2 = state[2] >> 2
+            "shr.b64  %6, %6, 36;\n\t"     // temp3 = state[3] >> 36
+            "shr.b64  %7, %7, 37;\n\t"     // temp4 = state[4] >> 37
+            
+            // Phase 3: All or operations in parallel
+            "or.b64   %0, %0, %4;\n\t"     // B[10] |= temp1
+            "or.b64   %1, %1, %5;\n\t"     // B[20] |= temp2
+            "or.b64   %2, %2, %6;\n\t"     // B[5] |= temp3
+            "or.b64   %3, %3, %7;"         // B[15] |= temp4
             
             : "=l"(B[10]), "=l"(B[20]), "=l"(B[5]), "=l"(B[15])
             : "l"(state[1]), "l"(state[2]), "l"(state[3]), "l"(state[4])
         );
         
         // y=1
-        B[16] = rotl64(state[5], 36U); // x=0, y=1: yp=(3*1)%5=3
-        B[1] = rotl64(state[6], 44U);  // x=1, y=1: yp=(2+3*1)%5=0
-        B[11] = rotl64(state[7], 6U);  // x=2, y=1: yp=(4+3*1)%5=2
-        B[21] = rotl64(state[8], 55U); // x=3, y=1: yp=(1+3*1)%5=4
-        B[6] = rotl64(state[9], 20U);  // x=4, y=1: yp=(3+3*1)%5=1
+        // Optimized rotl64 operations with instruction reordering for ILP
+        asm volatile (
+            // Phase 1: All shl operations in parallel (no dependencies)
+            "shl.b64  %0, %5, 36;\n\t"     // B[16] = state[5] << 36
+            "shl.b64  %1, %6, 44;\n\t"     // B[1] = state[6] << 44
+            "shl.b64  %2, %7, 6;\n\t"      // B[11] = state[7] << 6
+            "shl.b64  %3, %8, 55;\n\t"     // B[21] = state[8] << 55
+            "shl.b64  %4, %9, 20;\n\t"     // B[6] = state[9] << 20
+            
+            // Phase 2: All shr operations in parallel (input reuse optimization)
+            "shr.b64  %5, %5, 28;\n\t"     // temp1 = state[5] >> 28
+            "shr.b64  %6, %6, 20;\n\t"     // temp2 = state[6] >> 20
+            "shr.b64  %7, %7, 58;\n\t"     // temp3 = state[7] >> 58
+            "shr.b64  %8, %8, 9;\n\t"      // temp4 = state[8] >> 9
+            "shr.b64  %9, %9, 44;\n\t"     // temp5 = state[9] >> 44
+            
+            // Phase 3: All or operations in parallel
+            "or.b64   %0, %0, %5;\n\t"     // B[16] |= temp1
+            "or.b64   %1, %1, %6;\n\t"     // B[1] |= temp2
+            "or.b64   %2, %2, %7;\n\t"     // B[11] |= temp3
+            "or.b64   %3, %3, %8;\n\t"     // B[21] |= temp4
+            "or.b64   %4, %4, %9;"         // B[6] |= temp5
+            
+            : "=l"(B[16]), "=l"(B[1]), "=l"(B[11]), "=l"(B[21]), "=l"(B[6])
+            : "l"(state[5]), "l"(state[6]), "l"(state[7]), "l"(state[8]), "l"(state[9])
+        );
         
         // y=2
-        B[7] = rotl64(state[10], 3U);  // x=0, y=2: yp=(3*2)%5=1
-        B[17] = rotl64(state[11], 10U); // x=1, y=2: yp=(2+3*2)%5=3
-        B[2] = rotl64(state[12], 43U); // x=2, y=2: yp=(4+3*2)%5=0
-        B[12] = rotl64(state[13], 25U); // x=3, y=2: yp=(1+3*2)%5=2
-        B[22] = rotl64(state[14], 39U); // x=4, y=2: yp=(3+3*2)%5=4
+        // Optimized rotl64 operations with instruction reordering for ILP
+        asm volatile (
+            // Phase 1: All shl operations in parallel (no dependencies)
+            "shl.b64  %0, %5, 3;\n\t"      // B[7] = state[10] << 3
+            "shl.b64  %1, %6, 10;\n\t"     // B[17] = state[11] << 10
+            "shl.b64  %2, %7, 43;\n\t"     // B[2] = state[12] << 43
+            "shl.b64  %3, %8, 25;\n\t"     // B[12] = state[13] << 25
+            "shl.b64  %4, %9, 39;\n\t"     // B[22] = state[14] << 39
+            
+            // Phase 2: All shr operations in parallel (input reuse optimization)
+            "shr.b64  %5, %5, 61;\n\t"     // temp1 = state[10] >> 61
+            "shr.b64  %6, %6, 54;\n\t"     // temp2 = state[11] >> 54
+            "shr.b64  %7, %7, 21;\n\t"     // temp3 = state[12] >> 21
+            "shr.b64  %8, %8, 39;\n\t"     // temp4 = state[13] >> 39
+            "shr.b64  %9, %9, 25;\n\t"     // temp5 = state[14] >> 25
+            
+            // Phase 3: All or operations in parallel
+            "or.b64   %0, %0, %5;\n\t"     // B[7] |= temp1
+            "or.b64   %1, %1, %6;\n\t"     // B[17] |= temp2
+            "or.b64   %2, %2, %7;\n\t"     // B[2] |= temp3
+            "or.b64   %3, %3, %8;\n\t"     // B[12] |= temp4
+            "or.b64   %4, %4, %9;"         // B[22] |= temp5
+            
+            : "=l"(B[7]), "=l"(B[17]), "=l"(B[2]), "=l"(B[12]), "=l"(B[22])
+            : "l"(state[10]), "l"(state[11]), "l"(state[12]), "l"(state[13]), "l"(state[14])
+        );
         
         // y=3
-        B[23] = rotl64(state[15], 41U); // x=0, y=3: yp=(3*3)%5=4
-        B[8] = rotl64(state[16], 45U); // x=1, y=3: yp=(2+3*3)%5=1
-        B[18] = rotl64(state[17], 15U); // x=2, y=3: yp=(4+3*3)%5=3
-        B[3] = rotl64(state[18], 21U); // x=3, y=3: yp=(1+3*3)%5=0
-        B[13] = rotl64(state[19], 8U); // x=4, y=3: yp=(3+3*3)%5=2
+        // Optimized rotl64 operations with instruction reordering for ILP
+        asm volatile (
+            // Phase 1: All shl operations in parallel (no dependencies)
+            "shl.b64  %0, %5, 41;\n\t"     // B[23] = state[15] << 41
+            "shl.b64  %1, %6, 45;\n\t"     // B[8] = state[16] << 45
+            "shl.b64  %2, %7, 15;\n\t"     // B[18] = state[17] << 15
+            "shl.b64  %3, %8, 21;\n\t"     // B[3] = state[18] << 21
+            "shl.b64  %4, %9, 8;\n\t"      // B[13] = state[19] << 8
+            
+            // Phase 2: All shr operations in parallel (input reuse optimization)
+            "shr.b64  %5, %5, 23;\n\t"     // temp1 = state[15] >> 23
+            "shr.b64  %6, %6, 19;\n\t"     // temp2 = state[16] >> 19
+            "shr.b64  %7, %7, 49;\n\t"     // temp3 = state[17] >> 49
+            "shr.b64  %8, %8, 43;\n\t"     // temp4 = state[18] >> 43
+            "shr.b64  %9, %9, 56;\n\t"     // temp5 = state[19] >> 56
+            
+            // Phase 3: All or operations in parallel
+            "or.b64   %0, %0, %5;\n\t"     // B[23] |= temp1
+            "or.b64   %1, %1, %6;\n\t"     // B[8] |= temp2
+            "or.b64   %2, %2, %7;\n\t"     // B[18] |= temp3
+            "or.b64   %3, %3, %8;\n\t"     // B[3] |= temp4
+            "or.b64   %4, %4, %9;"         // B[13] |= temp5
+            
+            : "=l"(B[23]), "=l"(B[8]), "=l"(B[18]), "=l"(B[3]), "=l"(B[13])
+            : "l"(state[15]), "l"(state[16]), "l"(state[17]), "l"(state[18]), "l"(state[19])
+        );
         
         // y=4
-        B[14] = rotl64(state[20], 18U); // x=0, y=4: yp=(3*4)%5=2
-        B[24] = rotl64(state[21], 2U); // x=1, y=4: yp=(2+3*4)%5=4
-        B[9] = rotl64(state[22], 61U); // x=2, y=4: yp=(4+3*4)%5=1
-        B[19] = rotl64(state[23], 56U); // x=3, y=4: yp=(1+3*4)%5=3
-        B[4] = rotl64(state[24], 14U); // x=4, y=4: yp=(3+3*4)%5=0
+        // Optimized rotl64 operations with instruction reordering for ILP
+        asm volatile (
+            // Phase 1: All shl operations in parallel (no dependencies)
+            "shl.b64  %0, %5, 18;\n\t"     // B[14] = state[20] << 18
+            "shl.b64  %1, %6, 2;\n\t"      // B[24] = state[21] << 2
+            "shl.b64  %2, %7, 61;\n\t"     // B[9] = state[22] << 61
+            "shl.b64  %3, %8, 56;\n\t"     // B[19] = state[23] << 56
+            "shl.b64  %4, %9, 14;\n\t"     // B[4] = state[24] << 14
+            
+            // Phase 2: All shr operations in parallel (input reuse optimization)
+            "shr.b64  %5, %5, 46;\n\t"     // temp1 = state[20] >> 46
+            "shr.b64  %6, %6, 62;\n\t"     // temp2 = state[21] >> 62
+            "shr.b64  %7, %7, 3;\n\t"      // temp3 = state[22] >> 3
+            "shr.b64  %8, %8, 8;\n\t"      // temp4 = state[23] >> 8
+            "shr.b64  %9, %9, 50;\n\t"     // temp5 = state[24] >> 50
+            
+            // Phase 3: All or operations in parallel
+            "or.b64   %0, %0, %5;\n\t"     // B[14] |= temp1
+            "or.b64   %1, %1, %6;\n\t"     // B[24] |= temp2
+            "or.b64   %2, %2, %7;\n\t"     // B[9] |= temp3
+            "or.b64   %3, %3, %8;\n\t"     // B[19] |= temp4
+            "or.b64   %4, %4, %9;"         // B[4] |= temp5
+            
+            : "=l"(B[14]), "=l"(B[24]), "=l"(B[9]), "=l"(B[19]), "=l"(B[4])
+            : "l"(state[20]), "l"(state[21]), "l"(state[22]), "l"(state[23]), "l"(state[24])
+        );
         
         // Chi step - fully unrolled with no modulo operations
         #pragma unroll
@@ -258,7 +345,9 @@ __device__ __forceinline__ void keccak_f1600(uint64_t state[25]) {
             state[yy + 2] = B[yy + 2] ^ ((~B[yy + 3]) & B[yy + 4]);
             state[yy + 3] = B[yy + 3] ^ ((~B[yy + 4]) & B[yy + 0]);
             state[yy + 4] = B[yy + 4] ^ ((~B[yy + 0]) & B[yy + 1]);
+     
         }
+        
         
         // Iota step
         state[0] ^= KECCAK_RC[round];
