@@ -7,7 +7,7 @@
 
 
 // Batch size for walker kernel (matches Metal implementation)
-#define BATCH_WINDOW_SIZE 128
+#define BATCH_WINDOW_SIZE 512
 
 // ======================
 // CUDA Kernel Functions
@@ -144,19 +144,21 @@ extern "C" __global__ void vanity_walker_kernel(
     // Process in batches of BATCH_WINDOW_SIZE to avoid stack overflow
     uint32_t processed = 0;
     while (processed < steps_per_thread) {
+            move_u256(xs[0], x0);
+            move_u256(ys[0], y0);
+            move_u256(zs[0], z0);
+            point_add(x0, y0, z0, dx, dy);
+            move_u256(pref[0], zs[0]);
+
         // Generate batch_size points by repeated addition
-        for (int i = 0; i < BATCH_WINDOW_SIZE; ++i) {
+        for (int i = 1; i < BATCH_WINDOW_SIZE; ++i) {
             move_u256(xs[i], x0);
             move_u256(ys[i], y0);
             move_u256(zs[i], z0);
+            mul_mod(pref[i], pref[i-1], zs[i]);
             point_add(x0, y0, z0, dx, dy);
         }
-        
-        // Batch inversion using Montgomery trick
-        move_u256(pref[0], zs[0]);
-        for (int i = 1; i < BATCH_WINDOW_SIZE; ++i) {
-            mul_mod(pref[i], pref[i-1], zs[i]);
-        }
+       
         
         // Inverse total
         uint32_t inv_total[8];
@@ -164,13 +166,9 @@ extern "C" __global__ void vanity_walker_kernel(
         inv_mod(inv_total);
         
         // Backward pass and vanity check
-        for (int ii = (int)BATCH_WINDOW_SIZE-1; ii >= 0; --ii) {
+        for (int ii = (int)BATCH_WINDOW_SIZE-1; ii >= 1; --ii) {
             uint32_t inv_z[8];
-            if (ii == 0) {
-                move_u256(inv_z, inv_total);
-            } else {
-                mul_mod(inv_z, inv_total, pref[ii-1]);
-            }
+            mul_mod(inv_z, inv_total, pref[ii-1]);
             mul_mod(inv_total, inv_total, zs[ii]);
             
             // Convert to affine coordinates

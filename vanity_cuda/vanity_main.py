@@ -24,6 +24,14 @@ import queue
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+# Try to import web3 for address generation
+try:
+    from web3 import Web3
+    from eth_account import Account
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -92,182 +100,161 @@ class VanityAddressGenerator:
     
 
 
-    def run_continuous_parallel(self,
+    def run_continuous_pipeline(self,
                                target_pattern: str = "888",
                                batch_size: int = 10000,
-                               steps_per_thread: int = 256,
-                               useWalker: bool = True):
+                               steps_per_thread: int = 256):
         """
-        Run continuous vanity address generation with CPU-GPU parallelism
+        使用新的GPU pipeline系统运行连续vanity地址生成
         
         Args:
-            target_pattern: Hex pattern to search for
-            batch_size: Number of keys per batch
-            steps_per_thread: Steps per thread for walker kernel
+            target_pattern: 要搜索的十六进制模式
+            batch_size: 每批次的密钥数量  
+            steps_per_thread: walker kernel每个线程的步数
         """
-        print(f"Starting PARALLEL generation for pattern: {target_pattern}")
+        print(f"Starting PIPELINE generation for pattern: {target_pattern}")
         print(f"Batch size: {batch_size}, Steps per thread: {steps_per_thread}")
         print(f"Press Ctrl+C to stop\n")
         
-        # Start background private key generator
-        privkey_generator = PrivkeyGenerator(batch_size, steps_per_thread)
-        privkey_generator.start()
+        # 解析模式  
+        if "," in target_pattern:
+            head_pattern, tail_pattern = target_pattern.split(",", 1)
+        else:
+            head_pattern = target_pattern
+            tail_pattern = ""
+        
+        # 创建私钥生成器函数
+        def privkey_generator_func(size):
+            return generate_valid_privkeys(size, steps_per_thread, 128)
+        
+        # 使用pipeline生成器
+        pipeline = self.cuda_generator.create_continuous_pipeline(
+            privkey_generator=privkey_generator_func,
+            batch_size=batch_size,
+            steps_per_thread=steps_per_thread,
+            head_pattern=head_pattern,
+            tail_pattern=tail_pattern
+        )
         
         all_matches = []
         batch_count = 0
-        total_cpu_time = 0.0
-        total_queue_wait_time = 0.0
+        total_task_time = 0.0
+        start_time = time.perf_counter()
         
         try:
-            # Wait for first batch to be ready
-            print("Waiting for first batch of private keys...")
-            privkeys, cpu_time = privkey_generator.get_privkeys(timeout=10.0)
-            if privkeys is None:
-                print("Timeout waiting for first batch")
-                return
+            print("Starting pipeline execution...")
             
-            while True:
-                queue_wait_start = time.perf_counter()
-                
-                # Start generating next batch asynchronously while processing current
-                if privkey_generator.queue_size() == 0:
-                    print("Warning: GPU waiting for CPU (queue empty)")
-                
-                # Process current batch on GPU
+            for result, task_stats in pipeline:
                 batch_count += 1
                 
-                # Parse target pattern
-                if "," in target_pattern:
-                    head_pattern, tail_pattern = target_pattern.split(",", 1)
-                else:
-                    head_pattern = target_pattern
-                    tail_pattern = ""
-                
-                # Run GPU kernel
-                middle_gpu_time = 0
-                if useWalker:
-                    indices, gpu_time,middle_gpu_time = self.cuda_generator.generate_vanity_walker(
-                        privkeys,
-                        steps_per_thread=steps_per_thread,
-                        head_pattern=head_pattern,
-                        tail_pattern=tail_pattern
-                    )
-                    addresses_checked = batch_size * steps_per_thread
-                else:
-                    indices, gpu_time, all_addresses = self.cuda_generator.generate_vanity_simple(
-                        privkeys,
-                        head_pattern=head_pattern,
-                        tail_pattern=tail_pattern
-                    )
-                    addresses_checked = batch_size
-                
-                # Update statistics
+                # 更新统计信息
+                addresses_checked = task_stats['keys_processed']
                 self.stats["total_keys_processed"] += batch_size
                 self.stats["total_addresses_checked"] += addresses_checked
-                self.stats["total_matches_found"] += len(indices)
-                self.stats["total_gpu_time"] += gpu_time
-                total_cpu_time += cpu_time
+                self.stats["total_gpu_time"] += task_stats['total_time']
+                total_task_time += task_stats['total_time']
                 
-                # Get next batch (non-blocking, should be ready)
-                next_privkeys, next_cpu_time = privkey_generator.get_privkeys(timeout=0.1)
-                queue_wait_time = time.perf_counter() - queue_wait_start
-                total_queue_wait_time += queue_wait_time
-                
-                # Process results for current batch
-                results = {"matches": [],"batch_stats": {
+                # 处理当前批次的结果
+                results = {"matches": [], "batch_stats": {
                     "keys_processed": batch_size,
                     "addresses_checked": addresses_checked,
-                    "matches_found": len(indices),
-                    "gpu_time": gpu_time,
-                    "cpu_time": cpu_time,
-                    "middle_gpu_time": middle_gpu_time,
-                    "queue_wait_time": queue_wait_time,
-                    "throughput": addresses_checked / gpu_time / 1e6
+                    "matches_found": 0,
+                    "total_time": task_stats['total_time'],
+                    "compute_time": task_stats['compute_time'],
+                    "walker_time": task_stats['walker_time'],
+                    "throughput": addresses_checked / task_stats['total_time'] / 1e6 if task_stats['total_time'] > 0 else 0
                 }}
                 
-                # Extract matching private keys
-                for idx in indices:
-                    if useWalker:
-                        key_idx = idx // steps_per_thread
-                        step = idx % steps_per_thread
-                    else:
-                        key_idx = idx
-                        step = 0
-
-                    if key_idx < len(privkeys):
-                        base = int.from_bytes(privkeys[key_idx], "big")
-                        k = base + step
-                        n = SECP256K1_ORDER_INT
-                        if k >= n:
-                            k -= n
-                        if k == 0:
-                            k = 1
-                        base_key = k.to_bytes(32, "big")
-                        results["matches"].append({
-                            "private_key": base_key.hex(),
-                            "key_index": key_idx,
-                            "step": step,
-                            "head_pattern": head_pattern if head_pattern else None,
-                            "tail_pattern": tail_pattern if tail_pattern else None,
-                            "pattern": target_pattern
-                        })
+                if result is not None:
+                    # 找到匹配，恢复私钥
+                    indices = result['indices']
+                    results["batch_stats"]["matches_found"] = len(indices)
+                    self.stats["total_matches_found"] += len(indices)
+                    
+                    try:
+                        # 恢复私钥
+                        recovered_privkey = self.cuda_generator.recover_private_key_from_index(result)
+                        
+                        for idx in indices:
+                            results["matches"].append({
+                                "private_key": recovered_privkey.hex(),
+                                "found_index": idx,
+                                "task_id": task_stats['task_id'],
+                                "head_pattern": head_pattern if head_pattern else None,
+                                "tail_pattern": tail_pattern if tail_pattern else None,
+                                "pattern": target_pattern
+                            })
+                    except Exception as e:
+                        print(f"Error recovering private key: {e}")
+                        for idx in indices:
+                            results["matches"].append({
+                                "found_index": idx,
+                                "task_id": task_stats['task_id'],
+                                "error": str(e),
+                                "pattern": target_pattern
+                            })
                 
                 # Store matches
                 all_matches.extend(results["matches"])
                 
-                # Print progress with parallel statistics
-                avg_throughput = self.stats["total_addresses_checked"] / self.stats["total_gpu_time"] / 1e6
-                avg_cpu_time = total_cpu_time / batch_count
-                avg_queue_wait = total_queue_wait_time / batch_count
-                cpu_gpu_ratio = total_cpu_time / self.stats["total_gpu_time"] if self.stats["total_gpu_time"] > 0 else 0
+                # 获取GPU利用率统计  
+                gpu_stats = self.cuda_generator.get_gpu_utilization_stats()
+                avg_throughput = self.stats["total_addresses_checked"] / self.stats["total_gpu_time"] / 1e6 if self.stats["total_gpu_time"] > 0 else 0
                 
                 print(f"Batch {batch_count}: "
                       f"Found {len(results['matches'])} matches, "
                       f"Total: {self.stats['total_matches_found']}, "
                       f"Throughput: {results['batch_stats']['throughput']:.2f} MAddr/s, "
                       f"Avg: {avg_throughput:.2f} MAddr/s")
-                print(f"    Timing - GPU: {gpu_time:.3f}s, CPU: {cpu_time:.3f}s, "
-                      f"Queue wait: {queue_wait_time:.3f}s, Queue size: {privkey_generator.queue_size()}")
-                print(f"    Avg - CPU: {avg_cpu_time:.3f}s, Queue wait: {avg_queue_wait:.3f}s, "
-                      f"CPU/GPU ratio: {cpu_gpu_ratio:.2f}")
+                print(f"    Pipeline Timing - Total: {task_stats['total_time']*1000:.1f}ms, "
+                      f"Compute: {task_stats['compute_time']*1000:.1f}ms, "
+                      f"Walker: {task_stats['walker_time']*1000:.1f}ms")
+                print(f"    GPU Stats - Utilization: {gpu_stats['gpu_utilization_percent']:.1f}%, "
+                      f"Pipeline Efficiency: {gpu_stats['pipeline_efficiency']:.1f}%, "
+                      f"Active Tasks: {gpu_stats['total_active_tasks']}")
                 
-                # Check if we found matches
+                # 检查是否找到匹配
                 if len(all_matches) > 0:
-                    print(f"ans = {all_matches[0]}")
+                    match = all_matches[0]
+                    print(f"\n*** MATCH FOUND! ***")
+                    if 'private_key' in match:
+                        print(f"Private key: {match['private_key']}")
+                        
+                        # 如果有web3，生成地址
+                        if WEB3_AVAILABLE:
+                            try:
+                                account = Account.from_key(match['private_key'])
+                                print(f"Address: {account.address}")
+                                print(f"\nResult: private_key='{match['private_key']}', address='{account.address}'")
+                            except Exception as e:
+                                print(f"Error generating address: {e}")
+                    else:
+                        print(f"Found index: {match['found_index']}")
+                        print(f"Error: {match.get('error', 'Unknown error')}")
+                    
+                    print(f"Task ID: {match['task_id']}")
+                    print(f"Pattern: {match['pattern']}")
                     break
-                
-                # Use next batch
-                if next_privkeys is not None:
-                    privkeys, cpu_time = next_privkeys, next_cpu_time
-                else:
-                    # Fallback: wait for next batch
-                    print("GPU waiting for next batch...")
-                    privkeys, cpu_time = privkey_generator.get_privkeys(timeout=5.0)
-                    if privkeys is None:
-                        print("Timeout waiting for next batch")
-                        break
                     
         except KeyboardInterrupt:
-            print("\n\nStopping generation...")
-        finally:
-            privkey_generator.stop()
-            privkey_generator.join(timeout=1.0)
+            print("\n\nStopping pipeline generation...")
+        except StopIteration:
+            print("\nPipeline completed")
         
-        # Print final statistics with parallel info
-        self._print_final_stats_parallel(total_cpu_time, total_queue_wait_time)
+        # 打印最终的pipeline统计信息
+        self._print_final_stats_pipeline(total_task_time, start_time)
     
 
     
-    def _print_final_stats_parallel(self, total_cpu_time: float, total_queue_wait_time: float):
-        """Print final statistics for parallel execution"""
-        elapsed = time.time() - self.stats["start_time"]
+    def _print_final_stats_pipeline(self, total_task_time: float, start_time: float):
+        """打印pipeline执行的最终统计信息"""
+        elapsed = time.perf_counter() - start_time
         
         print("\n" + "="*60)
-        print("Final Statistics (Parallel Execution):")
-        print(f"  Total time: {elapsed:.2f} seconds")
-        print(f"  GPU time: {self.stats['total_gpu_time']:.2f} seconds")
-        print(f"  CPU time: {total_cpu_time:.2f} seconds")
-        print(f"  Queue wait time: {total_queue_wait_time:.2f} seconds")
+        print("Final Statistics (Pipeline Execution):")
+        print(f"  Total elapsed time: {elapsed:.2f} seconds")
+        print(f"  Total GPU time: {self.stats['total_gpu_time']:.2f} seconds")
+        print(f"  Total task time: {total_task_time:.2f} seconds")
         print(f"  Keys processed: {self.stats['total_keys_processed']:,}")
         print(f"  Addresses checked: {self.stats['total_addresses_checked']:,}")
         print(f"  Matches found: {self.stats['total_matches_found']:,}")
@@ -276,15 +263,17 @@ class VanityAddressGenerator:
             avg_throughput = self.stats["total_addresses_checked"] / self.stats["total_gpu_time"] / 1e6
             print(f"  Average throughput: {avg_throughput:.2f} MAddr/s")
             
-            # Parallel efficiency metrics
-            cpu_gpu_ratio = total_cpu_time / self.stats["total_gpu_time"]
+            # Pipeline效率指标
             gpu_utilization = self.stats["total_gpu_time"] / elapsed * 100
-            parallel_efficiency = (self.stats["total_gpu_time"] + total_cpu_time) / elapsed
+            pipeline_efficiency = total_task_time / elapsed * 100
             
-            print(f"  CPU/GPU time ratio: {cpu_gpu_ratio:.2f}")
             print(f"  GPU utilization: {gpu_utilization:.1f}%")
-            print(f"  Parallel efficiency: {parallel_efficiency:.2f}")
-            print(f"  Average queue wait: {total_queue_wait_time/elapsed*1000:.1f}ms per second")
+            print(f"  Pipeline efficiency: {pipeline_efficiency:.1f}%")
+            
+            # 获取最终GPU统计
+            final_gpu_stats = self.cuda_generator.get_gpu_utilization_stats()
+            print(f"  Final pipeline state: {final_gpu_stats['pipeline_efficiency']:.1f}% efficient")
+            print(f"  Active tasks at end: {final_gpu_stats['total_active_tasks']}")
         
         if self.stats["total_matches_found"] > 0:
             probability = self.stats["total_matches_found"] / self.stats["total_addresses_checked"]
@@ -294,20 +283,27 @@ class VanityAddressGenerator:
 def main():
     """Main entry point"""
     # Configuration variables
-    pattern = "1234,5678"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
+    pattern = "****,****"  # Can be "888" for head, ",abc" for tail, or "888,abc" for both
     batch_size = 4096*32
-    steps = 512*8
+    steps = 512*16
     device = 0
     useWalker = True
+    
     # Initialize generator
     generator = VanityAddressGenerator(device_id=device)
     
+    print(f"Configuration:")
+    print(f"  Pattern: {pattern}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Steps per thread: {steps}")
+    print(f"  Use Walker: {useWalker}")
+    print()
     
-    generator.run_continuous_parallel(
+    
+    generator.run_continuous_pipeline(
         target_pattern=pattern,
         batch_size=batch_size,
-        steps_per_thread=steps,
-        useWalker=useWalker
+        steps_per_thread=steps
     )
  
 

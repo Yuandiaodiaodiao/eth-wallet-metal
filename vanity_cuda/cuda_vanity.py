@@ -12,6 +12,183 @@ from pathlib import Path
 # Use cuda.core for modern CUDA programming
 from cuda.core.experimental import Device, LaunchConfig, Program, ProgramOptions, launch
 import cupy as cp
+from dataclasses import dataclass
+from enum import Enum
+from collections import deque
+import threading
+
+class TaskState(Enum):
+    READY = "ready"           # 任务准备就绪
+    COMPUTE_LOADING = "compute_loading"  # compute_base正在数据加载和排队
+    COMPUTE_RUNNING = "compute_running"  # compute_base kernel运行中
+    COMPUTE_DONE = "compute_done"        # compute_base完成，等待walker
+    WALKER_RUNNING = "walker_running"    # walker kernel运行中
+    COMPLETED = "completed"              # 任务完成
+    FAILED = "failed"                    # 任务失败
+
+@dataclass
+class GPUTask:
+    """GPU任务数据结构"""
+    task_id: int
+    privkeys_data: cp.ndarray
+    basepoints: cp.ndarray
+    found_indices: cp.ndarray
+    found_count: cp.ndarray
+    num_keys: int
+    steps_per_thread: int
+    state: TaskState = TaskState.READY
+    compute_event: object = None
+    walker_event: object = None
+    start_time: float = 0.0
+    compute_done_time: float = 0.0
+    walker_done_time: float = 0.0
+
+class GPUTaskQueue:
+    """GPU任务队列管理器，实现三缓冲pipeline"""
+    
+    def __init__(self, max_concurrent_tasks: int = 2):
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.tasks = deque()  # 任务队列
+        self.active_tasks = {}  # 正在执行的任务 {task_id: task}
+        self.completed_tasks = deque(maxlen=10)  # 已完成任务历史
+        self.next_task_id = 0
+        self.lock = threading.Lock()
+        
+        # 全局compute_base执行锁 - 确保只有一个compute_base在数据加载/排队
+        self.compute_global_lock = threading.Lock()
+        self.compute_loading_task_id = None  # 当前正在加载的任务ID
+        
+    def create_task(self, privkeys_data: cp.ndarray, num_keys: int, steps_per_thread: int, device) -> GPUTask:
+        """创建新的GPU任务"""
+        with self.lock:
+            task_id = self.next_task_id
+            self.next_task_id += 1
+            
+            # 分配GPU内存buffers
+            basepoints = cp.zeros(num_keys * 16, dtype=cp.uint32)
+            max_found = min(1, num_keys * steps_per_thread)
+            found_indices = cp.zeros(max_found, dtype=cp.uint32)
+            found_count = cp.zeros(1, dtype=cp.uint32)
+            
+            # 创建同步事件
+            compute_event = device.create_event()
+            walker_event = device.create_event()
+            
+            task = GPUTask(
+                task_id=task_id,
+                privkeys_data=privkeys_data,
+                basepoints=basepoints,
+                found_indices=found_indices,
+                found_count=found_count,
+                num_keys=num_keys,
+                steps_per_thread=steps_per_thread,
+                compute_event=compute_event,
+                walker_event=walker_event,
+                start_time=time.perf_counter()
+            )
+            
+            self.tasks.append(task)
+            return task
+    
+    def get_ready_tasks(self) -> List[GPUTask]:
+        """获取可以开始compute的任务"""
+        with self.lock:
+            ready_tasks = []
+            for task in list(self.tasks):
+                if task.state == TaskState.READY and len(self.active_tasks) < self.max_concurrent_tasks:
+                    ready_tasks.append(task)
+                    self.tasks.remove(task)
+                    self.active_tasks[task.task_id] = task
+                    # 注意：这里不直接设置为COMPUTE_RUNNING，而是在获取锁后设置为COMPUTE_LOADING
+            return ready_tasks
+    
+    def try_acquire_compute_lock(self, task_id: int) -> bool:
+        """尝试获取compute_base执行锁"""
+        if self.compute_global_lock.acquire(blocking=False):
+            with self.lock:
+                if task_id in self.active_tasks:
+                    task = self.active_tasks[task_id]
+                    task.state = TaskState.COMPUTE_LOADING
+                    self.compute_loading_task_id = task_id
+                    return True
+                else:
+                    # 任务不存在，释放锁
+                    self.compute_global_lock.release()
+                    return False
+        return False
+    
+    def release_compute_lock(self, task_id: int):
+        """释放compute_base执行锁"""
+        with self.lock:
+            if self.compute_loading_task_id == task_id:
+                self.compute_loading_task_id = None
+                if task_id in self.active_tasks:
+                    task = self.active_tasks[task_id]
+                    task.state = TaskState.COMPUTE_RUNNING
+        self.compute_global_lock.release()
+        
+    def get_loading_tasks(self) -> List[GPUTask]:
+        """获取可以开始实际执行compute kernel的任务（已获得锁的）"""
+        with self.lock:
+            loading_tasks = []
+            for task in self.active_tasks.values():
+                if task.state == TaskState.COMPUTE_LOADING:
+                    loading_tasks.append(task)
+            return loading_tasks
+    
+    def get_compute_done_tasks(self) -> List[GPUTask]:
+        """获取compute完成，可以开始walker的任务"""
+        with self.lock:
+            compute_done_tasks = []
+            for task in self.active_tasks.values():
+                if task.state == TaskState.COMPUTE_DONE:
+                    compute_done_tasks.append(task)
+                    task.state = TaskState.WALKER_RUNNING
+            return compute_done_tasks
+    
+    def mark_compute_done(self, task_id: int):
+        """标记compute阶段完成"""
+        with self.lock:
+            if task_id in self.active_tasks:
+                task = self.active_tasks[task_id]
+                task.state = TaskState.COMPUTE_DONE
+                task.compute_done_time = time.perf_counter()
+    
+    def mark_walker_done(self, task_id: int):
+        """标记walker阶段完成"""
+        with self.lock:
+            if task_id in self.active_tasks:
+                task = self.active_tasks[task_id]
+                task.state = TaskState.COMPLETED
+                task.walker_done_time = time.perf_counter()
+    
+    def get_completed_tasks(self) -> List[GPUTask]:
+        """获取已完成的任务"""
+        with self.lock:
+            completed = []
+            for task_id in list(self.active_tasks.keys()):
+                task = self.active_tasks[task_id]
+                if task.state == TaskState.COMPLETED:
+                    completed.append(task)
+                    del self.active_tasks[task_id]
+                    self.completed_tasks.append(task)
+            return completed
+    
+    def get_stats(self) -> dict:
+        """获取队列统计信息"""
+        with self.lock:
+            state_counts = {}
+            for task in self.active_tasks.values():
+                state = task.state.value
+                state_counts[state] = state_counts.get(state, 0) + 1
+            
+            return {
+                'queued_tasks': len(self.tasks),
+                'active_tasks': len(self.active_tasks),
+                'completed_tasks': len(self.completed_tasks),
+                'active_states': state_counts,
+                'compute_loading_task': self.compute_loading_task_id
+            }
 
 class CudaVanity:
     """CUDA-accelerated vanity address generator"""
@@ -22,9 +199,15 @@ class CudaVanity:
         self.device = Device(device_id)
         self.device.set_current()
         
-        # Create streams for operations
+        # Create streams for pipeline operations
         self.stream = self.device.create_stream()
         self.stream_g16 = self.device.create_stream()  # Separate stream for G16 table operations
+        self.stream_compute = self.device.create_stream()  # For compute_base kernels
+        self.stream_walker = self.device.create_stream()   # For walker kernels
+        
+        # Create events for synchronization
+        self.event_compute_done = self.device.create_event()
+        self.event_walker_done = self.device.create_event()
         
         # Pattern-optimized kernel cache
         self.pattern_kernel_cache = {}
@@ -49,6 +232,10 @@ class CudaVanity:
         
         # Load or build G16 table
         self._init_g16_table()
+        
+        # Pipeline state management
+        self.task_queue = None
+        self._init_task_queue()
         
     def _load_kernels(self):
         """Load and compile CUDA kernels"""
@@ -525,6 +712,9 @@ class CudaVanity:
         
         return optimized_kernels
     
+    def _init_task_queue(self):
+        """Initialize the GPU task queue for pipeline execution"""
+        self.task_queue = GPUTaskQueue()
     
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
@@ -662,7 +852,7 @@ class CudaVanity:
 
         # Stage 2: Walker kernel
         # Use smaller block size for walker due to higher register usage
-        block_size = 256
+        block_size = 128
         grid_size = num_keys // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print(f'launch walker {grid_size} {block_size}')
@@ -688,3 +878,330 @@ class CudaVanity:
         found_indices = d_found_indices[:found_count].get().tolist() if found_count > 0 else []
         
         return found_indices, gpu_time, middle_gpu_time
+    
+    def generate_vanity_walker_pipeline(self,
+                                        initial_privkeys_batch: List[List[bytes]],
+                                        steps_per_thread: int = 256,
+                                        head_pattern: str = "",
+                                        tail_pattern: str = "",
+                                        max_iterations: int = 1000) -> Tuple[List[int], float, dict]:
+        """
+        Pipeline版本的vanity生成器，实现GPU满载运行
+        
+        Args:
+            initial_privkeys_batch: 初始私钥批次列表
+            steps_per_thread: 每个线程检查的地址数
+            head_pattern: 地址前缀模式
+            tail_pattern: 地址后缀模式  
+            max_iterations: 最大迭代次数
+            
+        Returns:
+            Tuple of (found_indices, total_time_seconds, performance_stats)
+        """
+        print(f"Starting pipeline walker with {len(initial_privkeys_batch)} batches, pattern: '{head_pattern}', '{tail_pattern}'")
+        
+        # 获取优化内核
+        optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+        kernel_compute_base = optimized_kernels['compute_base']
+        kernel_walker = optimized_kernels['walker']
+        
+        # 重置任务队列
+        self.task_queue = GPUTaskQueue(max_concurrent_tasks=2)
+        
+        # 初始化性能统计
+        stats = {
+            'total_keys_processed': 0,
+            'compute_launches': 0,
+            'walker_launches': 0,
+            'pipeline_efficiency': 0.0,
+            'avg_gpu_utilization': 0.0,
+            'total_gpu_time': 0.0
+        }
+        
+        start_time = time.perf_counter()
+        iteration = 0
+        
+        # 初始化前两个任务
+        for i, privkeys in enumerate(initial_privkeys_batch[:2]):
+            privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
+            d_privkeys = cp.asarray(privkeys_data, dtype=cp.uint8)
+            task = self.task_queue.create_task(d_privkeys, len(privkeys), steps_per_thread, self.device)
+            print(f"Created initial task {task.task_id} with {len(privkeys)} keys")
+        
+        batch_index = 2  # 下一个要处理的批次索引
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # 1. 检查准备就绪的任务并尝试获取compute锁
+            ready_tasks = self.task_queue.get_ready_tasks()
+            for task in ready_tasks:
+                if self.task_queue.try_acquire_compute_lock(task.task_id):
+                    print(f"Task {task.task_id} acquired compute lock")
+                else:
+                    print(f"Task {task.task_id} waiting for compute lock")
+            
+            # 2. 启动已获得锁的compute任务
+            loading_tasks = self.task_queue.get_loading_tasks()
+            for task in loading_tasks:
+                self._launch_compute_base(task, kernel_compute_base)
+                stats['compute_launches'] += 1
+                print(f"Launched compute_base for task {task.task_id}")
+            
+            # 3. 启动compute完成的walker任务
+            compute_done_tasks = self.task_queue.get_compute_done_tasks()
+            for task in compute_done_tasks:
+                self._launch_walker(task, kernel_walker)
+                stats['walker_launches'] += 1
+                print(f"Launched walker for task {task.task_id}")
+            
+            # 4. 检查完成的任务
+            completed_tasks = self.task_queue.get_completed_tasks()
+            for task in completed_tasks:
+                found_count = int(task.found_count.get()[0])
+                if found_count > 0:
+                    found_indices = task.found_indices[:found_count].get().tolist()
+                    total_time = time.perf_counter() - start_time
+                    stats['total_keys_processed'] += task.num_keys * task.steps_per_thread
+                    print(f"Found match in task {task.task_id}: indices {found_indices}")
+                    return found_indices, total_time, stats
+                
+                stats['total_keys_processed'] += task.num_keys * task.steps_per_thread
+                print(f"Task {task.task_id} completed, no matches found")
+                
+                # 如果还有数据，创建新任务替换完成的任务
+                if batch_index < len(initial_privkeys_batch):
+                    privkeys = initial_privkeys_batch[batch_index]
+                    privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
+                    d_privkeys = cp.asarray(privkeys_data, dtype=cp.uint8)
+                    new_task = self.task_queue.create_task(d_privkeys, len(privkeys), steps_per_thread, self.device)
+                    batch_index += 1
+                    print(f"Created new task {new_task.task_id} to replace completed task")
+            
+            # 5. 检查事件状态更新
+            self._update_task_states()
+            
+            # 6. 简单的CPU睡眠避免忙等待
+            time.sleep(0.001)  # 1ms
+            
+            # 每100次迭代输出统计
+            if iteration % 100 == 0:
+                queue_stats = self.task_queue.get_stats()
+                print(f"Iteration {iteration}: {queue_stats}")
+        
+        # 超过最大迭代次数，返回统计
+        total_time = time.perf_counter() - start_time
+        return [], total_time, stats
+    
+    def _launch_compute_base(self, task: GPUTask, kernel_compute_base):
+        """启动compute_base kernel"""
+        block_size = 128
+        grid_size = (task.num_keys + block_size - 1) // block_size
+        config = LaunchConfig(grid=grid_size, block=block_size)
+        
+        launch(
+            self.stream_compute,
+            config,
+            kernel_compute_base,
+            task.privkeys_data.data.ptr,    # privkeys
+            task.basepoints.data.ptr,       # basepoints
+            self.g16_table.data.ptr,        # g16_table
+            cp.uint32(task.num_keys)        # num_keys
+        )
+        
+        # 记录事件标记compute完成
+        self.stream_compute.record(task.compute_event)
+        
+        # 释放compute锁，允许其他任务获取锁
+        self.task_queue.release_compute_lock(task.task_id)
+    
+    def _launch_walker(self, task: GPUTask, kernel_walker):
+        """启动walker kernel"""
+        block_size = 128
+        grid_size = task.num_keys // block_size
+        config = LaunchConfig(grid=grid_size, block=block_size)
+        
+        launch(
+            self.stream_walker,
+            config,
+            kernel_walker,
+            task.basepoints.data.ptr,       # basepoints
+            task.found_indices.data.ptr,    # found_indices
+            task.found_count.data.ptr,      # found_count
+            cp.uint32(task.num_keys),       # num_keys
+            cp.uint32(task.steps_per_thread) # steps_per_thread
+        )
+        
+        # 记录事件标记walker完成
+        self.stream_walker.record(task.walker_event)
+    
+    def _update_task_states(self):
+        """更新任务状态基于事件完成情况"""
+        for task in self.task_queue.active_tasks.values():
+            if task.state == TaskState.COMPUTE_RUNNING and task.compute_event.is_done:
+                self.task_queue.mark_compute_done(task.task_id)
+            elif task.state == TaskState.WALKER_RUNNING and task.walker_event.is_done:
+                self.task_queue.mark_walker_done(task.task_id)
+    
+    def get_gpu_utilization_stats(self) -> dict:
+        """获取GPU利用率统计信息"""
+        queue_stats = self.task_queue.get_stats()
+        
+        # 计算各个阶段的任务数
+        active_states = queue_stats.get('active_states', {})
+        compute_loading = active_states.get('compute_loading', 0)
+        compute_running = active_states.get('compute_running', 0)
+        walker_running = active_states.get('walker_running', 0) 
+        total_active = queue_stats['active_tasks']
+        
+        # GPU利用率估算（简化版）
+        utilization = 0.0
+        if total_active > 0:
+            # compute_loading不占用GPU，只有running状态才占用
+            utilization = (compute_running + walker_running) / max(1, total_active) * 100
+        
+        return {
+            'gpu_utilization_percent': utilization,
+            'compute_kernels_loading': compute_loading,
+            'compute_kernels_running': compute_running,
+            'walker_kernels_running': walker_running,
+            'total_active_tasks': total_active,
+            'queued_tasks': queue_stats['queued_tasks'],
+            'compute_loading_task': queue_stats.get('compute_loading_task'),
+            'pipeline_efficiency': min(100.0, total_active / 2.0 * 100)  # 2个并发任务为100%
+        }
+    
+    def create_continuous_pipeline(self, 
+                                   privkey_generator,
+                                   batch_size: int = 4096,
+                                   steps_per_thread: int = 256,
+                                   head_pattern: str = "",
+                                   tail_pattern: str = ""):
+        """
+        创建连续的pipeline执行器，可以与外部私钥生成器集成
+        
+        Args:
+            privkey_generator: 私钥生成器函数，返回List[bytes]
+            batch_size: 每批次私钥数量
+            steps_per_thread: 每个线程检查的地址数  
+            head_pattern: 地址前缀模式
+            tail_pattern: 地址后缀模式
+            
+        Yields:
+            生成器，产出(found_indices, task_stats)或None
+        """
+        print(f"Starting continuous pipeline: batch_size={batch_size}, steps_per_thread={steps_per_thread}")
+        
+        # 获取优化内核
+        optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+        kernel_compute_base = optimized_kernels['compute_base']
+        kernel_walker = optimized_kernels['walker']
+        
+        # 重置任务队列
+        self.task_queue = GPUTaskQueue(max_concurrent_tasks=2)
+        
+        # 初始化两个任务
+        for i in range(2):
+            privkeys = privkey_generator(batch_size)
+            privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
+            d_privkeys = cp.asarray(privkeys_data, dtype=cp.uint8)
+            task = self.task_queue.create_task(d_privkeys, len(privkeys), steps_per_thread, self.device)
+            print(f"Created initial pipeline task {task.task_id}")
+        
+        iteration = 0
+        
+        while True:
+            iteration += 1
+            
+            # Pipeline执行步骤
+            # 1. 检查准备就绪的任务并尝试获取compute锁
+            ready_tasks = self.task_queue.get_ready_tasks()
+            for task in ready_tasks:
+                self.task_queue.try_acquire_compute_lock(task.task_id)
+            
+            # 2. 启动已获得锁的compute任务
+            loading_tasks = self.task_queue.get_loading_tasks()
+            for task in loading_tasks:
+                self._launch_compute_base(task, kernel_compute_base)
+            
+            # 3. 启动compute完成的walker任务
+            compute_done_tasks = self.task_queue.get_compute_done_tasks()
+            for task in compute_done_tasks:
+                self._launch_walker(task, kernel_walker)
+            
+            completed_tasks = self.task_queue.get_completed_tasks()
+            for task in completed_tasks:
+                found_count = int(task.found_count.get()[0])
+                
+                # 计算任务统计
+                task_stats = {
+                    'task_id': task.task_id,
+                    'keys_processed': task.num_keys * task.steps_per_thread,
+                    'total_time': task.walker_done_time - task.start_time,
+                    'compute_time': task.compute_done_time - task.start_time,
+                    'walker_time': task.walker_done_time - task.compute_done_time
+                }
+                
+                if found_count > 0:
+                    found_indices = task.found_indices[:found_count].get().tolist()
+                    # 添加私钥恢复信息
+                    match_info = {
+                        'indices': found_indices,
+                        'task_id': task.task_id,
+                        'batch_privkeys': task.privkeys_data.get(),  # 完整的私钥数据
+                        'num_keys': task.num_keys,
+                        'steps_per_thread': task.steps_per_thread
+                    }
+                    yield match_info, task_stats
+                    return  # 找到结果后停止
+                else:
+                    yield None, task_stats
+                
+                # 创建新任务替换完成的任务
+                new_privkeys = privkey_generator(batch_size)
+                new_privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in new_privkeys])
+                new_d_privkeys = cp.asarray(new_privkeys_data, dtype=cp.uint8)
+                new_task = self.task_queue.create_task(new_d_privkeys, len(new_privkeys), steps_per_thread, self.device)
+            
+            # 更新任务状态
+            self._update_task_states()
+            
+            # 防止忙等待
+            time.sleep(0.001)
+    
+    def recover_private_key_from_index(self, match_info: dict) -> bytes:
+        """从匹配索引恢复私钥"""
+        indices = match_info['indices']
+        batch_privkeys = match_info['batch_privkeys']
+        num_keys = match_info['num_keys']
+        steps_per_thread = match_info['steps_per_thread']
+        
+        if not indices:
+            raise ValueError("No indices found in match_info")
+        
+        # 使用第一个匹配索引
+        idx = indices[0]
+        
+        # 计算私钥偏移
+        key_idx = idx // steps_per_thread
+        step = idx % steps_per_thread
+        
+        if key_idx >= num_keys:
+            raise ValueError(f"Key index {key_idx} out of range (max: {num_keys-1})")
+        
+        # 计算基私钥（每个私钥是32字节）
+        base_privkey_start = key_idx * 32
+        base_privkey_bytes = batch_privkeys[base_privkey_start:base_privkey_start + 32]
+        
+        # 计算最终私钥
+        base = int.from_bytes(base_privkey_bytes, "big")
+        k = base + step
+        
+        # 应用secp256k1曲线阶数模运算
+        SECP256K1_ORDER_INT = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        if k >= SECP256K1_ORDER_INT:
+            k -= SECP256K1_ORDER_INT
+        if k == 0:
+            k = 1
+            
+        return k.to_bytes(32, "big")
