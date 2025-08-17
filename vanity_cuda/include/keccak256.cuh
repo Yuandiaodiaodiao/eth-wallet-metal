@@ -469,17 +469,6 @@ __device__ __forceinline__ void eth_address(const uint32_t* xa, const uint32_t* 
 }
 
 
-// Check if address matches head and/or tail patterns (original version)
-__device__ __forceinline__ bool check_vanity_pattern(
-    const uint8_t* addr20,
-    const uint8_t* head_pattern, uint32_t head_nibbles,
-    const uint8_t* tail_pattern, uint32_t tail_nibbles) {
-    return true;
-}
-
-// Optimized pattern check using compile-time macros
-#ifdef USE_PATTERN_OPTIMIZATION
-
 // Default macro definitions (overridden by compiler defines)
 #ifndef CHECK_HEAD_PATTERN
 #define CHECK_HEAD_PATTERN(addr) (true)
@@ -489,12 +478,6 @@ __device__ __forceinline__ bool check_vanity_pattern(
 #define CHECK_TAIL_PATTERN(addr) (true)
 #endif
 
-// Ultra-fast pattern check with compile-time patterns
-__device__ __forceinline__ bool check_vanity_pattern_optimized(const uint8_t* addr20) {
-    return CHECK_HEAD_PATTERN(addr20) && CHECK_TAIL_PATTERN(addr20);
-}
-
-#endif // USE_PATTERN_OPTIMIZATION
 
 
 #endif // KECCAK256_CUH

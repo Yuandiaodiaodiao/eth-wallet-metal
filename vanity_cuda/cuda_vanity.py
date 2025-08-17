@@ -6,26 +6,12 @@ Following best practices from cuda-python examples
 import os
 import time
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from pathlib import Path
 
 # Use cuda.core for modern CUDA programming
-from cuda.core.experimental import Device, LaunchConfig, Program, ProgramOptions, launch, MemoryResource
+from cuda.core.experimental import Device, LaunchConfig, Program, ProgramOptions, launch
 import cupy as cp
-import concurrent.futures
-from dataclasses import dataclass
-
-@dataclass
-class AsyncGpuResult:
-    """Result from async GPU computation"""
-    future: concurrent.futures.Future
-    stream: 'Device.Stream'
-    start_event: 'Device.Event'
-    end_event: 'Device.Event'
-    d_found_indices: cp.ndarray
-    d_found_count: cp.ndarray
-    batch_size: int
-    steps_per_thread: int
 
 class CudaVanity:
     """CUDA-accelerated vanity address generator"""
@@ -36,21 +22,9 @@ class CudaVanity:
         self.device = Device(device_id)
         self.device.set_current()
         
-        # Create streams for async operations
+        # Create streams for operations
         self.stream = self.device.create_stream()
         self.stream_g16 = self.device.create_stream()  # Separate stream for G16 table operations
-        
-        # Additional streams for parallel processing
-        self.stream_compute = self.device.create_stream()  # Main computation stream
-        self.stream_transfer = self.device.create_stream() # Data transfer stream
-        self.stream_prefetch = self.device.create_stream() # Prefetch next batch stream
-        
-        # Events for synchronization
-        self.transfer_complete_event = self.device.create_event()
-        self.compute_complete_event = self.device.create_event()
-        
-        # Thread pool for async operations
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
         # Pattern-optimized kernel cache
         self.pattern_kernel_cache = {}
@@ -65,9 +39,9 @@ class CudaVanity:
         print(f"Using CUDA device: {self.device.name}")
         print(f"Compute capability: {self.compute_capability}")
         print(f"Architecture: sm_{self.arch}")
-        
-        # Load and compile kernels
         self._load_kernels()
+        # Load and compile kernels
+        self._load_g16_kernel()
         
         # G16 precomputed table
         self.g16_table = None
@@ -80,18 +54,26 @@ class CudaVanity:
         """Load and compile CUDA kernels"""
         kernel_dir = Path(__file__).parent
         
-        # Read kernel source files
+        # Read main kernel source files
         with open(kernel_dir / "kernels.cu", "r") as f:
             kernel_source = f.read()
         
         # Store base kernel source for pattern-optimized compilation
         self.base_kernel_source = kernel_source
         
-        # Combine sources (headers are included via #include in kernels.cu)
-        # For cuda.core, we need to provide the full source with includes resolved
-        full_source = kernel_source
+      
         
-        # Compile options with minimal includes
+        # Separately load G16 table kernel
+    
+    def _load_g16_kernel(self):
+        """Load and compile G16 table builder kernel separately"""
+        kernel_dir = Path(__file__).parent
+        
+        # Read G16 kernel source
+        with open(kernel_dir / "g16_table.cu", "r") as f:
+            g16_source = f.read()
+        
+        # Compile options
         cuda_include_path = os.path.join(os.environ.get("CUDA_PATH", ""), "include")
         include_paths = [str(kernel_dir)]
         if os.path.exists(cuda_include_path):
@@ -103,24 +85,12 @@ class CudaVanity:
             use_fast_math=True
         )
         
-        # Create program and compile
-        self.program = Program(full_source, code_type="c++", options=program_options)
+        # Create and compile G16 program
+        self.g16_program = Program(g16_source, code_type="c++", options=program_options)
+        self.g16_module = self.g16_program.compile("cubin", name_expressions=["build_g16_table_kernel"])
         
-        # Compile to cubin and get kernel functions
-        kernel_names = [
-            "vanity_kernel_g16",
-            "compute_basepoints_g16", 
-            "vanity_walker_kernel",
-            "build_g16_table_kernel"
-        ]
-        
-        self.module = self.program.compile("cubin", name_expressions=kernel_names)
-        
-        # Get kernel references
-        self.kernel_vanity_g16 = self.module.get_kernel("vanity_kernel_g16")
-        self.kernel_compute_base = self.module.get_kernel("compute_basepoints_g16")
-        self.kernel_walker = self.module.get_kernel("vanity_walker_kernel")
-        self.kernel_build_g16 = self.module.get_kernel("build_g16_table_kernel")
+        # Get G16 kernel reference
+        self.kernel_build_g16 = self.g16_module.get_kernel("build_g16_table_kernel")
         
     def _init_g16_table(self):
         """Initialize or load G16 precomputed table"""
@@ -462,7 +432,11 @@ class CudaVanity:
     def _get_pattern_kernel(self, head_pattern: str, tail_pattern: str):
         """Get or compile pattern-optimized kernel"""
         pattern_key = (head_pattern, tail_pattern)
-        
+           # Escape special characters in pattern strings for safe filename
+        safe_head = head_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if head_pattern else 'EMPTY'
+        safe_tail = tail_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if tail_pattern else 'EMPTY'
+        kernel_dir = Path(__file__).parent
+        debug_path = kernel_dir / f"debug_optimized_{safe_head}_{safe_tail}.cu"
         # Check cache
         if pattern_key in self.pattern_kernel_cache:
             return self.pattern_kernel_cache[pattern_key]
@@ -498,7 +472,6 @@ class CudaVanity:
         optimized_source = '\n'.join(optimized_lines)
         
         # Compile options
-        kernel_dir = Path(__file__).parent
         cuda_include_path = os.path.join(os.environ.get("CUDA_PATH", ""), "include")
         include_paths = [str(kernel_dir)]
         if os.path.exists(cuda_include_path):
@@ -514,15 +487,17 @@ class CudaVanity:
             device_code_optimize=True,
             extra_device_vectorization=True,
         )
-        
+    
+        with open(debug_path, "w") as f:
+            f.write(optimized_source)
+            print(f"Debug: Saved optimized source to {debug_path}")
         # Create and compile program
         program = Program(optimized_source, code_type="c++", options=program_options)
         
         kernel_names = [
             "vanity_kernel_g16",
             "compute_basepoints_g16", 
-            "vanity_walker_kernel",
-            "build_g16_table_kernel"
+            "vanity_walker_kernel"
         ]
         
         module = program.compile("cubin", name_expressions=kernel_names)
@@ -531,8 +506,7 @@ class CudaVanity:
         optimized_kernels = {
             'vanity_g16': module.get_kernel("vanity_kernel_g16"),
             'compute_base': module.get_kernel("compute_basepoints_g16"),
-            'walker': module.get_kernel("vanity_walker_kernel"),
-            'build_g16': module.get_kernel("build_g16_table_kernel")
+            'walker': module.get_kernel("vanity_walker_kernel")
         }
         
         # Cache the compiled kernels
@@ -546,48 +520,11 @@ class CudaVanity:
             print(f"  {line}")
         
         # Debug: save optimized source to file for inspection
-        # Escape special characters in pattern strings for safe filename
-        safe_head = head_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if head_pattern else 'EMPTY'
-        safe_tail = tail_pattern.replace('*', 'STAR').replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_') if tail_pattern else 'EMPTY'
-        debug_path = kernel_dir / f"debug_optimized_{safe_head}_{safe_tail}.cu"
-        with open(debug_path, "w") as f:
-            f.write(optimized_source)
-        print(f"Debug: Saved optimized source to {debug_path}")
+     
+       
         
         return optimized_kernels
     
-    def _pattern_to_bytes(self, pattern: str) -> Tuple[cp.ndarray, int]:
-        """Convert hex pattern string to byte array for GPU processing
-        
-        Args:
-            pattern: Hex pattern string (may contain wildcards '*')
-            
-        Returns:
-            Tuple of (pattern_bytes, nibble_count)
-        """
-        if not pattern:
-            return cp.zeros(0, dtype=cp.uint8), 0
-        
-        # Check if pattern contains wildcards
-        if '*' in pattern:
-            # For wildcard patterns, we use optimized kernels that don't need pattern bytes
-            return cp.zeros(1, dtype=cp.uint8), 0  # Dummy values
-        
-        pattern = pattern.lower()
-        nibble_count = len(pattern)
-        byte_count = (nibble_count + 1) // 2
-        
-        # Convert hex string to bytes (packed nibbles)
-        pattern_bytes = np.zeros(byte_count, dtype=np.uint8)
-        for i in range(0, len(pattern), 2):
-            if i + 1 < len(pattern):
-                # Two nibbles -> one byte
-                pattern_bytes[i // 2] = (int(pattern[i], 16) << 4) | int(pattern[i + 1], 16)
-            else:
-                # One nibble -> half byte (left-padded)
-                pattern_bytes[i // 2] = int(pattern[i], 16) << 4
-        
-        return cp.asarray(pattern_bytes, dtype=cp.uint8), nibble_count
     
     def generate_vanity_simple(self, 
                               privkeys: List[bytes],
@@ -607,15 +544,13 @@ class CudaVanity:
         print(f"Generating {len(privkeys)} private keys...")
         num_keys = len(privkeys)
         
-        # Convert pattern strings to byte arrays (only for non-wildcard patterns)
-        d_head_pattern, head_nibbles = self._pattern_to_bytes(head_pattern)
-        d_tail_pattern, tail_nibbles = self._pattern_to_bytes(tail_pattern)
+        # Always get pattern-optimized kernels
+        optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+        kernel_vanity_g16 = optimized_kernels['vanity_g16']
+        print(f"Using optimized kernel for head='{head_pattern}', tail='{tail_pattern}'")
         
-        # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
-        if head_nibbles == 0:
-            d_head_pattern = cp.zeros(1, dtype=cp.uint8)
-        if tail_nibbles == 0:
-            d_tail_pattern = cp.zeros(1, dtype=cp.uint8)
+        # Pattern optimization mode doesn't need pattern byte arrays
+        # (patterns are compiled into the kernel as macros)
         
         # Prepare input data
         privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
@@ -640,17 +575,13 @@ class CudaVanity:
         launch(
             self.stream,
             config,
-            self.kernel_vanity_g16,
+            kernel_vanity_g16,
             d_privkeys.data.ptr,        # privkeys
             d_found_indices.data.ptr,   # found_indices
             d_found_count.data.ptr,     # found_count
             d_outbuffer.data.ptr,       # outbuffer
             self.g16_table.data.ptr,    # g16_table
-            cp.uint32(num_keys),        # num_keys
-            d_head_pattern.data.ptr,    # head_pattern
-            cp.uint32(head_nibbles),    # head_nibbles
-            d_tail_pattern.data.ptr,    # tail_pattern
-            cp.uint32(tail_nibbles)     # tail_nibbles
+            cp.uint32(num_keys)         # num_keys
         )
         
         # Wait for completion
@@ -686,26 +617,14 @@ class CudaVanity:
              
         num_keys = len(privkeys)
         
-        # Get pattern-optimized kernels
-        if head_pattern or tail_pattern:
-            optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
-            kernel_compute_base = optimized_kernels['compute_base']
-            kernel_walker = optimized_kernels['walker']
-            print(f"Using optimized kernel for head='{head_pattern}', tail='{tail_pattern}'")
-        else:
-            # Use default kernels for no pattern
-            kernel_compute_base = self.kernel_compute_base
-            kernel_walker = self.kernel_walker
+        # Always get pattern-optimized kernels
+        optimized_kernels = self._get_pattern_kernel(head_pattern, tail_pattern)
+        kernel_compute_base = optimized_kernels['compute_base']
+        kernel_walker = optimized_kernels['walker']
+        print(f"Using optimized kernel for head='{head_pattern}', tail='{tail_pattern}'")
         
-        # Convert pattern strings to byte arrays (only for non-wildcard patterns)
-        d_head_pattern, head_nibbles = self._pattern_to_bytes(head_pattern)
-        d_tail_pattern, tail_nibbles = self._pattern_to_bytes(tail_pattern)
-        
-        # Ensure we have valid pointers for CUDA (use dummy arrays if pattern is empty)
-        if head_nibbles == 0:
-            d_head_pattern = cp.zeros(1, dtype=cp.uint8)
-        if tail_nibbles == 0:
-            d_tail_pattern = cp.zeros(1, dtype=cp.uint8)
+        # Pattern optimization mode doesn't need pattern byte arrays
+        # (patterns are compiled into the kernel as macros)
         
         # Prepare input data
         privkeys_data = np.concatenate([np.frombuffer(k, dtype=np.uint8) for k in privkeys])
@@ -743,25 +662,21 @@ class CudaVanity:
 
         # Stage 2: Walker kernel
         # Use smaller block size for walker due to higher register usage
-        block_size = 64
-        grid_size = (num_keys + block_size - 1) // block_size
+        block_size = 256
+        grid_size = num_keys // block_size
         config = LaunchConfig(grid=grid_size, block=block_size)
         print(f'launch walker {grid_size} {block_size}')
-        # Use optimized kernel without pattern parameters if optimization is enabled
-        if head_pattern or tail_pattern:
-            # Optimized kernel doesn't need pattern parameters
-            launch(
-                self.stream,
-                config,
-                kernel_walker,
-                d_basepoints.data.ptr,      # basepoints
-                d_found_indices.data.ptr,   # found_indices
-                d_found_count.data.ptr,     # found_count
-                cp.uint32(num_keys),        # num_keys
-                cp.uint32(steps_per_thread), # steps_per_thread
-            )
-        else:
-           raise NotImplementedError("Pattern optimization is not supported for walker kernel")
+        # Always use optimized kernel (no pattern parameters needed)
+        launch(
+            self.stream,
+            config,
+            kernel_walker,
+            d_basepoints.data.ptr,      # basepoints
+            d_found_indices.data.ptr,   # found_indices
+            d_found_count.data.ptr,     # found_count
+            cp.uint32(num_keys),        # num_keys
+            cp.uint32(steps_per_thread), # steps_per_thread
+        )
         print('sync')
         # Wait for completion
         self.stream.sync()
@@ -772,9 +687,4 @@ class CudaVanity:
         found_count = int(d_found_count.get()[0])
         found_indices = d_found_indices[:found_count].get().tolist() if found_count > 0 else []
         
-        return found_indices, gpu_time , middle_gpu_time
-    
-
-    
-  
-
+        return found_indices, gpu_time, middle_gpu_time
