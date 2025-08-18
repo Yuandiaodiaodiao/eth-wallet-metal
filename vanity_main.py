@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from typing import Optional
 
@@ -35,6 +36,7 @@ def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_t
     jobs = [job_0, job_1]
     gen_times = [gen_0_sec, gen_1_sec]
 
+    process_birth = time.perf_counter()
     while True:
         batches += 1
         # Wait for the oldest job to complete
@@ -100,6 +102,21 @@ def main(batch_size: int = 384*8, max_batches: Optional[int] = None, steps_per_t
         
         # Move to next buffer in circular fashion
         current_buffer = (current_buffer + 1) % len(jobs)
+        
+        # Periodic self-fork-and-restart every 5 minutes to mitigate any long-lived leaks
+        if time.perf_counter() - process_birth >= 300:
+            print("[self-restart] 5 minutes elapsed, forking a fresh worker and exiting old process...")
+            try:
+                pid = os.fork()
+            except OSError:
+                pid = -1
+            if pid == 0:
+                # Child: exec a fresh interpreter running this script
+                script_path = os.path.abspath(__file__)
+                os.execv(sys.executable, [sys.executable, script_path])
+            else:
+                # Parent: exit immediately
+                os._exit(0)
         
         if max_batches is not None and batches >= max_batches:
             print("No match in", batches, "batches")

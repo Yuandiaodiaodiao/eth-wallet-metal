@@ -39,6 +39,9 @@ def build_g16_table(metal_vanity_instance, repo_root: str) -> None:
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()  # sequential to limit VRAM pressure while building
+            # Drop strong refs promptly to free CPU-side resources between chunks
+            enc = None
+            cb = None
             start += chunk
     # Optionally write to disk for future runs
     try:

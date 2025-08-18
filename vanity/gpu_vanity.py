@@ -595,6 +595,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         enc.setBuffer_offset_atIndex_(index_compact_buffer, 0, 1)
         enc.setBuffer_offset_atIndex_(out_count_buffer, 0, 2)
         # Prefer setBytes for small constant params; fall back to a temp buffer if unavailable
+        params_buffer = None
         try:
             enc.setBytes_length_atIndex_(bytes(p), 52, 3)
         except Exception:
@@ -617,6 +618,10 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         enc.endEncoding()
 
         job = MetalVanity.VanityJobCompact(cb, index_compact_buffer, out_count_buffer, count)
+        # Hold strong references to buffers until GPU completion to avoid early GC
+        job._buffers = [in_buffer, index_compact_buffer, out_count_buffer]
+        if params_buffer is not None:
+            job._buffers.append(params_buffer)
         job.effective_steps_per_thread = 1
 
         def _on_completed(inner_cb):
@@ -640,7 +645,15 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
                 job._error = e
             finally:
                 job.cpu_completion_seconds = time.perf_counter() - cpu_start
-                job._done_event.set()
+                # Release GPU resources promptly after results are copied out
+                try:
+                    job.index_compact_buffer = None
+                    job.out_count_buffer = None
+                    job.cb = None
+                    if hasattr(job, "_buffers"):
+                        job._buffers = []
+                finally:
+                    job._done_event.set()
 
         cb.addCompletedHandler_(_on_completed)
         cb.commit()
@@ -729,6 +742,8 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
 
         t_cpu0 = time.perf_counter()
         cb = self.queue.commandBuffer()
+        # Keep references to all buffers used in this job until completion
+        buffers_to_hold = [in_buffer, base_points_buffer, index_compact_buffer, out_count_buffer]
         
         # Build or reuse specialized pipelines for this steps_per_thread
         _, walk_pipeline, compute_base_w16_pipeline = self._ensure_walk_pipelines(steps_per_thread)
@@ -742,6 +757,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         enc1.setComputePipelineState_(compute_base_w16_pipeline)
         enc1.setBuffer_offset_atIndex_(in_buffer, 0, 0)
         enc1.setBuffer_offset_atIndex_(base_points_buffer, 0, 1)
+        params_buffer = None
         try:
             enc1.setBytes_length_atIndex_(bytes(p), 52, 2)
         except Exception:
@@ -772,7 +788,7 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         try:
             enc2.setBytes_length_atIndex_(bytes(p), 52, 3)
         except Exception:
-            if 'params_buffer' not in locals():
+            if params_buffer is None:
                 params_buffer = self.device.newBufferWithLength_options_(52, 0)
                 params_buffer.contents().as_buffer(52)[:52] = bytes(p)
             enc2.setBuffer_offset_atIndex_(params_buffer, 0, 3)
@@ -787,6 +803,10 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
         enc2.endEncoding()
 
         job = MetalVanity.VanityJobCompact(cb, index_compact_buffer, out_count_buffer, capacity_count)
+        # Hold strong references to all relevant buffers to avoid early GC
+        if params_buffer is not None:
+            buffers_to_hold.append(params_buffer)
+        job._buffers = buffers_to_hold
         job.effective_steps_per_thread = int(steps_per_thread)
 
         def _on_completed(inner_cb):
@@ -807,7 +827,15 @@ struct VanityParams { uint count; uint nibbleCount; uchar pattern[20]; uint suff
                 job._error = e
             finally:
                 job.cpu_completion_seconds = time.perf_counter() - cpu_start
-                job._done_event.set()
+                # Release GPU resources promptly after results are copied out
+                try:
+                    job.index_compact_buffer = None
+                    job.out_count_buffer = None
+                    job.cb = None
+                    if hasattr(job, "_buffers"):
+                        job._buffers = []
+                finally:
+                    job._done_event.set()
 
         cb.addCompletedHandler_(_on_completed)
         cb.commit()
